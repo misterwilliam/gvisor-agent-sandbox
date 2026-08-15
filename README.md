@@ -64,8 +64,8 @@ A few non-obvious properties, each verified experimentally, worth knowing before
 
 ## Status
 
-Early. The self-test built into `sandbox.py` (`python3 sandbox.py`) is the current test
-suite and the best executable documentation of what the sandbox guarantees. No CI yet.
+Early. `self_test.py` (`python3 self_test.py`) is the current test suite and the best
+executable documentation of what the sandbox guarantees. No CI yet.
 
 ## License
 
