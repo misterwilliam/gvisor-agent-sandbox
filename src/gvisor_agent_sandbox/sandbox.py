@@ -33,7 +33,6 @@ from pathlib import Path
 # make, and friends - enough for "write a C compiler"-shaped tasks without a
 # custom image.
 DEFAULT_IMAGE = "python:3.12"
-DEFAULT_RUNTIME = "runsc"
 
 # Where the harness scratch mount lands inside the container. Deliberately
 # NOT under /workspace: the workspace is the measured artifact and shouldn't
@@ -592,7 +591,6 @@ class Sandbox:
         self,
         workspace: str | Path,
         image: str = DEFAULT_IMAGE,
-        runtime: str = DEFAULT_RUNTIME,
         network: str = "none",
         memory: str = "2g",
         cpus: str = "2",
@@ -602,7 +600,6 @@ class Sandbox:
     ):
         self.workspace = Path(workspace).resolve()
         self.image = image
-        self.runtime = runtime
         self.network = network
         self.memory = memory
         self.cpus = cpus
@@ -623,7 +620,7 @@ class Sandbox:
 
         cmd = [
             "docker", "run", "-d", "--rm",
-            "--runtime", self.runtime,
+            "--runtime", "runsc",
             "--network", self.network,
             "--memory", self.memory,
             "--cpus", self.cpus,

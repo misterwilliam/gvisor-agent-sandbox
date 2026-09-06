@@ -9,7 +9,6 @@ test_units.py.
 All of these share one container (see the `sbx` fixture). Skipped
 automatically where Docker or gVisor is missing.
 """
-
 import pytest
 
 from gvisor_agent_sandbox import Sandbox
@@ -187,7 +186,6 @@ def test_session_state_survives_a_kill(sbx):
 
 
 # ---- isolation ----------------------------------------------------------
-
 
 def test_container_has_no_network(sbx):
     # If this ever passes, the agent can exfiltrate whatever it can read.

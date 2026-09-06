@@ -9,7 +9,6 @@ do.
 
 from .sandbox import (
     DEFAULT_IMAGE,
-    DEFAULT_RUNTIME,
     MAX_OUTPUT_BYTES,
     PersistentShell,
     Sandbox,
@@ -20,7 +19,6 @@ from .sandbox import (
 
 __all__ = [
     "DEFAULT_IMAGE",
-    "DEFAULT_RUNTIME",
     "MAX_OUTPUT_BYTES",
     "PersistentShell",
     "Sandbox",
