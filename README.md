@@ -8,6 +8,8 @@ reaches in through tools rather than running inside it — never has a network p
 exfiltrate an API key it was never given.
 
 ```python
+from gvisor_agent_sandbox import Sandbox
+
 with Sandbox("/path/to/empty/workspace") as sbx:
     sbx.shell_exec("cd /workspace && python3 -m venv venv")
     sbx.shell_exec("source venv/bin/activate")
@@ -50,7 +52,7 @@ inside it (key custody, audit-log integrity, artifact purity), and for the wire 
 between the host and the persistent bash session.
 
 A few non-obvious properties, each verified experimentally, worth knowing before editing
-`sandbox.py`:
+`src/gvisor_agent_sandbox/sandbox.py`:
 
 - The agent's command text is passed through a *file* and run via `builtin eval
   "$(<file)"`, never written to bash's stdin directly — raw text on stdin means an
@@ -62,10 +64,27 @@ A few non-obvious properties, each verified experimentally, worth knowing before
 - Sessions die from ordinary agent behavior (`set -e` then a failure; `set -o posix` then a
   syntax error). The design restarts and reports rather than trying to prevent every case.
 
+## Tests
+
+```bash
+uv run pytest                    # everything (~18s; needs Docker + gVisor)
+uv run pytest -m "not docker"    # pure logic only (~0.1s; runs anywhere)
+```
+
+The suite is split so that half of it has no infrastructure requirements. `tests/`
+covers path resolution, output truncation, result rendering, the startup preconditions
+and `file_write` without a container at all — including the traversal check, which is
+the most security-relevant code here. The rest is marked `docker` and skipped with a
+printed reason when the runtime isn't available, so `uv run pytest` is safe on a machine
+that can't run containers.
+
+The container tests share one session-scoped sandbox and reset the shell session between
+tests, which keeps the whole suite under twenty seconds.
+
 ## Status
 
-Early. `self_test.py` (`python3 self_test.py`) is the current test suite and the best
-executable documentation of what the sandbox guarantees. No CI yet.
+Early, but the behaviour above is covered by tests rather than asserted in prose. No CI
+yet; `-m "not docker"` is the half that could gate a pull request today.
 
 ## License
 

@@ -1,0 +1,25 @@
+[project]
+name = "gvisor-agent-sandbox"
+version = "0.1.0"
+description = "A gVisor-isolated container an LLM agent drives through tools."
+readme = "README.md"
+authors = [
+    { name = "William Chang", email = "misterwilliam@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "docker: needs Docker with the gVisor runtime registered as `runsc` (auto-skipped otherwise)",
+]
