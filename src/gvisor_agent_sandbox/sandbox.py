@@ -1,12 +1,5 @@
 """Agentic sandbox: a gVisor-isolated container an agent drives through tools.
 
-Replaces the earlier chroot approach (see ai/continual_learning/sandbox.py).
-What that needed and this doesn't: root at invocation time, a dedicated
-unprivileged user, and a hand-populated jail rootfs. The container image is
-the filesystem, and Docker handles the privilege boundary.
-
-Two levels of persistence:
-
 - One container per Sandbox instance (not per command), so installed
   packages, files, and background processes survive across calls.
 - One long-lived bash process per Sandbox, so cwd, environment variables,
@@ -24,10 +17,6 @@ agent gets the output so far, then decides whether to keep waiting
 (`shell_wait`) or stop it (`shell_kill`). A slow test suite and a hung
 process look identical to a fixed timeout but not to an agent holding the
 partial output, so the judgment belongs there.
-
-Requires: docker, and the gVisor runtime registered as `runsc`. The invoking
-user must be in the `docker` group (no sudo needed - if you just added
-yourself, start a new shell for it to take effect).
 """
 
 import os
