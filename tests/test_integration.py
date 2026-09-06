@@ -197,14 +197,20 @@ def test_container_has_no_network(sbx):
     assert result.exit_code != 0, "the container reached the network - isolation has regressed"
 
 
-def test_file_write_is_visible_inside_the_container(sbx):
-    # file_write goes through the bind mount rather than the shell, so it works
-    # even while a long command holds the session - but it has to land where
-    # the container can see it.
-    sbx.file_write("src/hi.py", "print('from file_write')\n")
-    result = sbx.shell.run("python3 /workspace/src/hi.py")
+# ---- writing files ------------------------------------------------------
+
+
+def test_heredoc_writes_exact_content(sbx):
+    # The shell is the only way to create a file, so byte fidelity is a
+    # guarantee this harness has to make. Passing command text through a file
+    # is what allows a quoted heredoc to carry content that would otherwise be
+    # mangled by expansion.
+    content = '#!/bin/sh\nname="$USER and `whoami`"\necho \'single\' "double" \\back\n'
+    result = sbx.shell.run(
+        f"mkdir -p /workspace/gen && cat > /workspace/gen/f.sh <<'XEOF'\n{content}XEOF\n"
+    )
     assert result.exit_code == 0
-    assert "from file_write" in result.output
+    assert (sbx.workspace / "gen/f.sh").read_text() == content
 
 
 # ---- lifecycle ----------------------------------------------------------
@@ -214,11 +220,11 @@ def test_workspace_outlives_the_container(tmp_path):
     # The workspace is the measured artifact; the container is disposable.
     # Needs its own sandbox because it asserts on state after teardown.
     with Sandbox(tmp_path) as sandbox:
-        sandbox.file_write("written.txt", "by file_write\n")
         sandbox.shell.run("echo by-the-shell > /workspace/generated.txt")
+        sandbox.shell.run("mkdir -p /workspace/sub && echo nested > /workspace/sub/deep.txt")
 
-    assert (tmp_path / "written.txt").read_text() == "by file_write\n"
     assert (tmp_path / "generated.txt").read_text().strip() == "by-the-shell"
+    assert (tmp_path / "sub/deep.txt").read_text().strip() == "nested"
     assert sandbox.container_id is None
 
 

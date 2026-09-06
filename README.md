@@ -34,10 +34,14 @@ harness.
 
 ## Tools
 
-- `file_write(path, content)`
 - `shell_exec(command, timeout=None)`
 - `shell_wait(timeout=None)`
 - `shell_kill()`
+
+Every tool runs inside the container, so the container boundary is the only thing that
+has to hold: no tool touches the host filesystem at a path the agent chooses. Files are
+created through the shell, and a quoted heredoc carries content verbatim because command
+text reaches bash through a file rather than a command line.
 
 ## Requirements
 
@@ -72,11 +76,10 @@ uv run pytest -m "not docker"    # pure logic only (~0.1s; runs anywhere)
 ```
 
 The suite is split so that half of it has no infrastructure requirements. `tests/`
-covers path resolution, output truncation, result rendering, the startup preconditions
-and `file_write` without a container at all — including the traversal check, which is
-the most security-relevant code here. The rest is marked `docker` and skipped with a
-printed reason when the runtime isn't available, so `uv run pytest` is safe on a machine
-that can't run containers.
+covers output truncation, result rendering and the startup preconditions without a
+container at all. The rest is marked `docker` and skipped with a printed reason when the
+runtime isn't available, so `uv run pytest` is safe on a machine that can't run
+containers.
 
 The container tests share one session-scoped sandbox and reset the shell session between
 tests, which keeps the whole suite under twenty seconds.

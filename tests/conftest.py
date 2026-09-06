@@ -65,10 +65,10 @@ def _reset_session(request):
     """Undo session state a test leaves behind.
 
     Because the container is shared, cwd, exported variables and shell
-    functions would otherwise leak into whatever runs next - which is exactly
-    the order-dependence that made the old linear self-test hard to debug. A
-    test that fails mid-command also leaves one pending, so kill that first or
-    the reset itself would be rejected.
+    functions would otherwise leak into whatever runs next, making tests
+    order-dependent and failures hard to localise. A test that fails
+    mid-command also leaves one pending, so kill that first or the reset
+    itself would be rejected.
     """
     yield
 

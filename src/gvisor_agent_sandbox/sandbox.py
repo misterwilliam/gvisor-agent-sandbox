@@ -44,33 +44,8 @@ SCRATCH_GUEST = "/harness"
 MAX_OUTPUT_BYTES = 30_000
 
 
-class SandboxViolation(Exception):
-    """Raised when a tool call tries to escape the sandbox workspace."""
-
-
 class SandboxError(Exception):
     """Raised when the container or shell fails to start."""
-
-
-def _resolve_in_workspace(root: Path, raw_path: str) -> Path:
-    """Reinterpret raw_path (which may look absolute) as rooted at `root`.
-
-    Rejects any path containing '..'. There is no other POSIX path syntax
-    meaning "go up a directory", so this is complete against traversal-by-
-    syntax; the remaining symlink-escape route is closed by requiring the
-    workspace to start empty and by the container boundary itself.
-    """
-    if ".." in Path(raw_path).parts:
-        raise SandboxViolation(f"path contains '..': {raw_path!r}")
-
-    # Strip a leading '/' so an "absolute-looking" agent path is reinterpreted
-    # relative to the workspace, not the host's real root.
-    candidate = (root / raw_path.lstrip("/")).resolve()
-
-    root_resolved = root.resolve()
-    if candidate != root_resolved and root_resolved not in candidate.parents:
-        raise SandboxViolation(f"path resolves outside workspace: {raw_path!r}")
-    return candidate
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
@@ -511,24 +486,6 @@ class Sandbox:
 
     TOOLS = [
         {
-            "name": "file_write",
-            "description": (
-                "Write text content to a file in your workspace, overwriting it if it "
-                "already exists. Creates parent directories as needed."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path, resolved inside your workspace.",
-                    },
-                    "content": {"type": "string", "description": "Full text content to write."},
-                },
-                "required": ["path", "content"],
-            },
-        },
-        {
             "name": "shell_exec",
             "description": (
                 "Run a command in a persistent bash session inside your container. Returns "
@@ -680,28 +637,8 @@ class Sandbox:
             return "ERROR: sandbox is not running"
         return self.shell.kill().render()
 
-    def file_write(self, path: str, content: str) -> str:
-        """Write a file into the workspace from the host side.
-
-        Goes through the bind mount rather than the shell, which avoids having
-        to get arbitrary file content through a command line at all - and works
-        even while a long-running command holds the shell.
-        """
-        try:
-            target = _resolve_in_workspace(self.workspace, path)
-        except SandboxViolation as e:
-            return f"ERROR: {e}"
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content)
-            return f"wrote {len(content)} bytes to {path}"
-        except Exception as e:
-            return f"ERROR: {e}"
-
     def dispatch(self, tool_name: str, tool_input: dict) -> str:
         """Route a tool_use block to the matching method."""
-        if tool_name == "file_write":
-            return self.file_write(tool_input["path"], tool_input["content"])
         if tool_name == "shell_exec":
             return self.shell_exec(tool_input["command"], tool_input.get("timeout"))
         if tool_name == "shell_wait":

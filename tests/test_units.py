@@ -2,48 +2,17 @@
 
 Worth keeping separate from the integration tests: this file runs in
 milliseconds anywhere Python does, which makes it the half that can gate a
-pull request. It also covers the traversal check, which is the most
-security-relevant code in the project and happens not to need Docker at all.
+pull request.
 """
 
 import pytest
 
 import gvisor_agent_sandbox
-from gvisor_agent_sandbox import Sandbox, SandboxError, SandboxViolation, ShellResult
+from gvisor_agent_sandbox import Sandbox, SandboxError, ShellResult
 
 # Private helpers aren't re-exported from the package root, so they come from
 # the module directly.
-from gvisor_agent_sandbox.sandbox import _resolve_in_workspace, _truncate
-
-# ---- path resolution ----------------------------------------------------
-
-
-def test_relative_path_lands_in_the_workspace(tmp_path):
-    assert _resolve_in_workspace(tmp_path, "src/hi.py") == tmp_path / "src/hi.py"
-
-
-def test_absolute_looking_path_is_reinterpreted(tmp_path):
-    # A leading '/' means the workspace root, not the host's - otherwise an
-    # agent could name any file on the machine and have it resolve.
-    assert _resolve_in_workspace(tmp_path, "/etc/passwd") == tmp_path / "etc/passwd"
-
-
-@pytest.mark.parametrize(
-    "bad_path",
-    ["../escape.txt", "../../etc/passwd", "a/../../b", "sub/..", "/../escape.txt"],
-)
-def test_traversal_is_rejected(tmp_path, bad_path):
-    with pytest.raises(SandboxViolation, match=r"contains '\.\.'"):
-        _resolve_in_workspace(tmp_path, bad_path)
-
-
-def test_symlink_escape_is_rejected(tmp_path):
-    # '..' is not the only way out. resolve() follows symlinks, so it's the
-    # containment check - not the '..' check - that catches this one.
-    (tmp_path / "link").symlink_to("/etc")
-    with pytest.raises(SandboxViolation, match="resolves outside workspace"):
-        _resolve_in_workspace(tmp_path, "link/passwd")
-
+from gvisor_agent_sandbox.sandbox import _truncate
 
 # ---- output truncation --------------------------------------------------
 
@@ -119,26 +88,11 @@ def test_workspace_must_exist(tmp_path):
 
 
 def test_workspace_must_start_empty(tmp_path):
-    # The empty-workspace rule is load-bearing: it's what closes the symlink
-    # escape route that path syntax alone can't.
+    # Starting clean is what makes the workspace a trustworthy artifact: every
+    # file in it afterwards came from this run.
     (tmp_path / "leftover.txt").write_text("from a previous run")
     with pytest.raises(SandboxError, match="not empty"):
         Sandbox(tmp_path).start()
-
-
-# ---- file_write, which goes through the bind mount, not the shell -------
-
-
-def test_file_write_creates_parent_directories(tmp_path):
-    sandbox = Sandbox(tmp_path)
-    assert sandbox.file_write("src/deep/hi.py", "print('hi')\n").startswith("wrote")
-    assert (tmp_path / "src/deep/hi.py").read_text() == "print('hi')\n"
-
-
-def test_file_write_refuses_to_escape_the_workspace(tmp_path):
-    sandbox = Sandbox(tmp_path)
-    assert sandbox.file_write("../escape.txt", "nope").startswith("ERROR: path contains '..'")
-    assert not (tmp_path.parent / "escape.txt").exists()
 
 
 # ---- tool surface -------------------------------------------------------
@@ -168,7 +122,6 @@ def test_every_advertised_tool_is_dispatchable(tmp_path):
     # given - without being wired into dispatch, which would surface to the
     # agent as an unexplained error mid-task.
     minimal_input = {
-        "file_write": {"path": "f.txt", "content": ""},
         "shell_exec": {"command": "true"},
         "shell_wait": {},
         "shell_kill": {},
