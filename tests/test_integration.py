@@ -197,6 +197,27 @@ def test_container_has_no_network(sbx):
     assert result.exit_code != 0, "the container reached the network - isolation has regressed"
 
 
+def test_out_file_symlink_cannot_leak_a_host_file(tmp_path):
+    # The harness scratch dir is bind-mounted into the container, so the agent
+    # can see its out-file and replace it with a symlink to a host path. The
+    # harness must read the output it captured, never whatever that name now
+    # resolves to - otherwise the tool result becomes an arbitrary host-file
+    # read, straight back to the model, with no network required.
+    secret = tmp_path / "host_only_secret.txt"  # outside the workspace
+    secret.write_text("HOST-SECRET-THE-AGENT-MUST-NOT-SEE\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    with Sandbox(workspace) as sandbox:
+        result = sandbox.shell.run(
+            "T=$(ls /harness | grep '^out_'); "
+            f"ln -sf {secret} /harness/$T; "
+            "echo the-real-output"
+        )
+    assert "HOST-SECRET" not in result.output, "harness followed the symlink to a host file"
+    assert "the-real-output" in result.output
+
+
 # ---- writing files ------------------------------------------------------
 
 

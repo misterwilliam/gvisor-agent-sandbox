@@ -128,11 +128,17 @@ class ShellResult:
 class _Pending:
     """A command that was started and hasn't reported completion yet."""
 
-    def __init__(self, token: str, marker: str, cmd_file: Path, out_file: Path):
+    def __init__(self, token: str, marker: str, cmd_file: Path, out_file: Path, out_fd: int):
         self.token = token
         self.marker = marker
         self.cmd_file = cmd_file
         self.out_file = out_file
+        # A file descriptor opened on the out-file at creation, read through
+        # ever after. The agent can see /harness and can replace the out-file's
+        # directory entry with a symlink to a host path; re-opening by name
+        # would then follow it and hand a host file back as command output.
+        # A descriptor references the inode, not the name, so the swap is inert.
+        self.out_fd = out_fd
         self.started_at = time.monotonic()
         self.last_output_at = time.monotonic()
         self.shown = 0  # characters of out_file already returned to the agent
@@ -311,7 +317,11 @@ class PersistentShell:
         cmd_file = self.scratch_host / f"cmd_{token}"
         out_file = self.scratch_host / f"out_{token}"
         cmd_file.write_text(command)
-        out_file.touch()
+        # O_EXCL: we must be the file's creator. Bash's `> out_file` then
+        # truncates this same inode, so the descriptor we hold and the one bash
+        # writes through point at the same file - and stay pointed at it even if
+        # the agent later swaps the directory entry for a symlink (see _drain).
+        out_fd = os.open(out_file, os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o600)
 
         marker = f"__DONE_{token}__"
         script = (
@@ -323,13 +333,14 @@ class PersistentShell:
         try:
             self._write(script)
         except (BrokenPipeError, SandboxError):
+            os.close(out_fd)
             self.start()
             return ShellResult(
                 status="session_lost",
                 note="the shell session had ended and was restarted; cwd and environment were reset",
             )
 
-        self._pending = _Pending(token, marker, cmd_file, out_file)
+        self._pending = _Pending(token, marker, cmd_file, out_file, out_fd)
         return self._settle(timeout)
 
     def wait(self, timeout: int | None = None) -> ShellResult:
@@ -414,13 +425,18 @@ class PersistentShell:
         )
 
     def _drain(self, pending: _Pending) -> str:
-        """Return output not yet shown to the agent, advancing the cursor."""
-        if not pending.out_file.exists():
-            return ""
+        """Return output not yet shown to the agent, advancing the cursor.
+
+        Reads through the descriptor opened at creation, never by re-opening the
+        path: the out-file lives in a mount the agent can write, so resolving it
+        by name would follow a symlink the agent had pointed at a host file.
+        """
         try:
-            data = pending.out_file.read_text(errors="replace")
+            size = os.fstat(pending.out_fd).st_size
+            raw = os.pread(pending.out_fd, size, 0) if size else b""
         except OSError:
             return ""
+        data = raw.decode(errors="replace")
         new = data[pending.shown :]
         if new:
             pending.shown = len(data)
@@ -428,6 +444,10 @@ class PersistentShell:
         return new
 
     def _finish(self, pending: _Pending) -> None:
+        try:
+            os.close(pending.out_fd)
+        except OSError:
+            pass
         for f in (pending.cmd_file, pending.out_file):
             f.unlink(missing_ok=True)
         self._pending = None
