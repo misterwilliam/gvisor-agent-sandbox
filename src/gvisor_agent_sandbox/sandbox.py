@@ -617,7 +617,6 @@ class Sandbox:
         self,
         workspace: str | Path,
         image: str = DEFAULT_IMAGE,
-        network: str = "none",
         memory: str = "2g",
         cpus: str = "2",
         pids_limit: int = 512,
@@ -626,7 +625,6 @@ class Sandbox:
     ):
         self.workspace = Path(workspace).resolve()
         self.image = image
-        self.network = network
         self.memory = memory
         self.cpus = cpus
         self.pids_limit = pids_limit
@@ -647,7 +645,11 @@ class Sandbox:
         cmd = [
             "docker", "run", "-d", "--rm",
             "--runtime", "runsc",
-            "--network", self.network,
+            # Not configurable. The threat model is a capable, possibly hostile
+            # agent; egress would let it exfiltrate data, reach a C2 host, or
+            # attack third parties from this machine - risks the syscall and
+            # filesystem boundaries do nothing about. `none` is the whole point.
+            "--network", "none",
             "--memory", self.memory,
             "--cpus", self.cpus,
             "--pids-limit", str(self.pids_limit),

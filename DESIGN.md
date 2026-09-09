@@ -12,7 +12,7 @@ Two architectures are possible:
 
 - **Agent outside** (chosen): the harness runs on the host and reaches into the container
   through tools (`shell_exec`, `shell_wait`, `shell_kill`). The container never sees an API
-  key and can run with `--network=none`.
+  key and runs airgapped with `--network=none` (not configurable).
 - **Agent inside**: package the harness, its dependencies, and the task into the image and
   run the whole loop in the container. The agent gets direct filesystem/shell access with
   no tool plumbing at all.
