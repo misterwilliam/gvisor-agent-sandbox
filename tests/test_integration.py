@@ -218,6 +218,29 @@ def test_out_file_symlink_cannot_leak_a_host_file(tmp_path):
     assert "the-real-output" in result.output
 
 
+def test_out_file_redirect_attempt_is_detected(tmp_path):
+    # Blocking the leak is the safety guarantee; recording the attempt is the
+    # audit signal on top of it. An ordinary command must not register, and the
+    # redirect must, with the host path the agent aimed at.
+    secret = tmp_path / "host_only_secret.txt"
+    secret.write_text("HOST-SECRET-THE-AGENT-MUST-NOT-SEE\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    with Sandbox(workspace) as sandbox:
+        sandbox.shell.run("echo an ordinary command")
+        assert sandbox.tamper_events == [], "a benign command was flagged as tampering"
+
+        sandbox.shell.run(
+            "T=$(ls /harness | grep '^out_'); "
+            f"ln -sf {secret} /harness/$T; "
+            "echo hi"
+        )
+        assert any(str(secret) in target for target in sandbox.tamper_events), (
+            f"redirect to {secret} was not detected; events={sandbox.tamper_events}"
+        )
+
+
 # ---- writing files ------------------------------------------------------
 
 

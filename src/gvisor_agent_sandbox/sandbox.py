@@ -19,15 +19,19 @@ process look identical to a fixed timeout but not to an agent holding the
 partial output, so the judgment belongs there.
 """
 
+import logging
 import os
 import queue
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Full python image (not -slim) is based on buildpack-deps, so it ships gcc,
 # make, and friends - enough for "write a C compiler"-shaped tasks without a
@@ -142,6 +146,7 @@ class _Pending:
         self.started_at = time.monotonic()
         self.last_output_at = time.monotonic()
         self.shown = 0  # characters of out_file already returned to the agent
+        self.tamper_target: str | None = None  # set once if the out-file entry is redirected
 
     @property
     def elapsed(self) -> float:
@@ -214,6 +219,10 @@ class PersistentShell:
         self._queue: queue.Queue = queue.Queue()
         self._shell_pid: int | None = None
         self._pending: _Pending | None = None
+        # Resolved host paths the agent tried to redirect a command's out-file
+        # at. The fd-based read makes these harmless, so this is an audit trail
+        # of attempts, not a list of leaks.
+        self.tamper_events: list[str] = []
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -424,6 +433,35 @@ class PersistentShell:
             idle=pending.idle,
         )
 
+    def _out_file_redirect_target(self, pending: _Pending) -> str | None:
+        """If the out-file's directory entry no longer names the file we
+        created, return where it now points, else None.
+
+        The harness only ever writes regular files into the scratch dir, so a
+        symlink there - or an entry whose inode differs from the one we hold
+        open - is the agent redirecting our read at a host path. Detection is
+        by effect, not by inspecting the command, so it does not care how the
+        redirect was written (`ln`, `mv`, `python -c`, a compiled helper). It
+        is a point-in-time check and a backgrounded flip-flop could dodge it;
+        that is acceptable because the fd-based read is what makes the redirect
+        harmless, and this is only the audit signal layered on top.
+        """
+        try:
+            entry = os.lstat(pending.out_file)  # the name, not followed
+        except OSError:
+            return None
+        if stat.S_ISLNK(entry.st_mode):
+            try:
+                return os.readlink(pending.out_file)
+            except OSError:
+                return "<unreadable symlink>"
+        try:
+            if entry.st_ino != os.fstat(pending.out_fd).st_ino:
+                return "<entry replaced>"
+        except OSError:
+            return None
+        return None
+
     def _drain(self, pending: _Pending) -> str:
         """Return output not yet shown to the agent, advancing the cursor.
 
@@ -431,6 +469,17 @@ class PersistentShell:
         path: the out-file lives in a mount the agent can write, so resolving it
         by name would follow a symlink the agent had pointed at a host file.
         """
+        if pending.tamper_target is None:
+            target = self._out_file_redirect_target(pending)
+            if target is not None:
+                pending.tamper_target = target
+                self.tamper_events.append(target)
+                logger.warning(
+                    "a command's out-file was redirected to %r - the agent tried to "
+                    "read a host path through the harness (blocked by the held fd)",
+                    target,
+                )
+
         try:
             size = os.fstat(pending.out_fd).st_size
             raw = os.pread(pending.out_fd, size, 0) if size else b""
@@ -639,6 +688,17 @@ class Sandbox:
 
     def __exit__(self, *_exc) -> None:
         self.stop()
+
+    @property
+    def tamper_events(self) -> list[str]:
+        """Host paths the agent tried to redirect command out-files at, in order.
+
+        Empty in normal use. Non-empty means the agent attempted to read a host
+        file through the harness (the attempt is blocked; this is the audit
+        trail). A caller enforcing a policy can poll this and tear the sandbox
+        down; a caller studying agent behaviour can log it and continue.
+        """
+        return list(self.shell.tamper_events) if self.shell is not None else []
 
     # ---- tool implementations -------------------------------------------
 
