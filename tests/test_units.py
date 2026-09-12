@@ -59,10 +59,6 @@ def test_killed_names_the_signal():
     assert "[SIGTERM after 2s]" in rendered
 
 
-def test_session_lost_says_so():
-    assert "session lost" in ShellResult("", status="session_lost", note="restarted").render()
-
-
 def test_running_with_output_reports_progress():
     rendered = ShellResult("tick\n", status="running", elapsed=3.0, idle=0.1).render()
     assert "still running after 3s" in rendered

@@ -34,51 +34,55 @@ Reasons for choosing agent-outside:
 4. **Dev-loop friction.** Iterating on harness code means rebuilding an image rather than
    rerunning a script.
 
-### Runtime
+### Persistent container, stateless commands
 
-Conceptually there are two layers, and the distinction should be visible to the agent:
+State persists at two very different levels, and only the durable one is kept:
 
 - **Container (durable).** Files, installed packages, background processes. Everything
-  expensive - the actual work product - lives here.
-- **Shell session (cheap, recoverable).** cwd, exported environment, shell functions,
-  aliases, shell options. All of it re-derivable in a command or two.
+  expensive - the actual work product - lives here, for the life of the sandbox.
+- **Shell session (not kept).** cwd, exported environment, shell functions. Each command
+  runs as its own `docker exec`, so none of this carries from one command to the next.
 
-When the agent makes multiple `shell_exec` calls, they normally will hit the same bash
-sessions so all state specific to that session will be preserved. However if that bash
-session terminates the agent will be informed by an error message that current shell
-session terminated and the next shell_exec will be started in a new shell session, but in
-the same container.
+The reasoning is in the README ("Why stateless commands instead of a persistent shell"):
+a human needs shell-session state, an agent does not (absolute paths, chaining within one
+command), and dropping the persistent shell removes the completion-detection problem that
+a shared, long-lived stream forces. Detecting when a command has finished on a shared bash
+stream is impossible without either reinterpreting the command or injecting a sentinel and
+scanning output for it; process-per-command makes "done" simply the process exiting.
 
-To make interaction with agent more natural in a text based manner we will not be using
-TTY but instead using pipes for stdin, stdout, stderr. Response seen by agent will be
-stdout and stderr interleaved. This allows the agent to see the timing of the output and
-since this is how humans typically have their shell sessions this should be fairly
-intuitive for the agent.
-
-**Starting container**
+**Starting the container**
 
 ```sh
-# Start container
-CONTAINER_ID=$(docker run -d --rm --runtime runsc python:3.12 sleep infinity)
-# Start session
-docker exec -i ${CONTAINER_ID} bash
+docker run -d --rm --runtime runsc --network none \
+  -v <workspace>:/workspace -w /workspace <image> sleep infinity
 ```
 
-**Execute command**
+The container just idles on `sleep infinity`; it is the durable layer. `sleep infinity`
+runs as PID 1 inside it.
 
-Then to execute a command, we write the following to stdin to the process
-`<command>\nbuiltin printf '__DONE__:%d' $?`. We use `builtin printf` to emit a marker
-that shows when the command terminates. This is similar to how a human uses `$PS1` being
-emitted to see when a command is finished. While `docker exec -i` is called interactive
-mode it just pipes stdin. It doesn't actually trigger bash interactive mode so `$PS1` is
-not used by bash. To protect against the agent defining a `printf` function which causes
-shadowing of the printf function we call `builting printf`.
+**Executing a command**
 
-Command will actually be written to a file, and executed using `eval $(</my_cmd_file)`.
-This protects against malformed bash commands that aren't terminated causing the bash
-session to hang.
+Each command is one exec:
 
-The harness will scan for the `__DONE__` end marker until a timeout, and return the
-interleaved stdout and stderr back to the agent. The returned output will include the
-`__DONE__` marker with return code of the command. If the timeout is hit the interleaved
-stdout and stderr is returned immediately (without the `__DONE__` marker).
+```sh
+docker exec -w /workspace <cid> bash -c 'echo "__PID__$$"; exec bash -c "$1" 2>&1' bash <command>
+```
+
+- **Command as argv, not string.** `<command>` is passed as its own argument (`$1`), never
+  interpolated into a shell string, so arbitrary quotes, newlines, and backslashes need no
+  escaping.
+- **Pid line.** `echo "__PID__$$"` runs before the `exec` (which preserves the pid), so it
+  prints the pid of the bash that goes on to run the command. That pid is what `shell_kill`
+  targets (`pkill -P <pid>` for its children, `kill <pid>` for the bash). It is the
+  guaranteed-first line of output, stripped by the reader, so no command output can be
+  mistaken for it.
+- **`2>&1` inside the container.** `docker exec` carries stdout and stderr as separate
+  streams whose relative ordering is lost in transit, so stderr is merged into stdout at
+  the source. The agent sees interleaved output as it would in a terminal.
+- **stdin is /dev/null.** A command that reads stdin gets EOF rather than hanging.
+
+Completion is the exec process exiting; `docker exec` propagates the command's exit code. A
+reader thread drains the merged output so a still-running command's partial output can be
+returned on a timeout, at which point the agent chooses `shell_wait` or `shell_kill`. A
+syntax error or a shell-fatal setting (`set -e` then a failure) just makes that one
+command's bash exit non-zero - there is no shared session to wedge.

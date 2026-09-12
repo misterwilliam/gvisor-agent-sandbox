@@ -1,6 +1,6 @@
 """Container-backed tests: the properties that need a real gVisor sandbox.
 
-These assert against `sbx.shell.run(...)`, which returns a `ShellResult`,
+These assert against `sbx.runner.run(...)`, which returns a `ShellResult`,
 rather than `sbx.shell_exec(...)`, which returns rendered text. Asserting on
 fields instead of substrings means a change to the wording of the output
 doesn't break behavioural tests - the wording has its own tests in
@@ -20,106 +20,91 @@ pytestmark = pytest.mark.docker
 
 
 def test_command_runs_and_reports_success(sbx):
-    result = sbx.shell.run("echo hello")
+    result = sbx.runner.run("echo hello")
     assert result.status == "completed"
     assert result.exit_code == 0
     assert "hello" in result.output
 
 
 def test_exit_code_is_propagated(sbx):
-    # `(exit 3)`, not `exit 3`: the command runs in a brace group in the
-    # *current* shell, so a bare `exit` takes the session down with it - see
-    # test_exit_ends_the_session_and_says_so.
-    result = sbx.shell.run("(exit 3)")
+    # Each command is its own `docker exec`, so a bare `exit 3` just ends that
+    # command with code 3 - there is no shared session for it to take down.
+    result = sbx.runner.run("exit 3")
     assert result.status == "completed"
     assert result.exit_code == 3
 
 
 def test_shell_features_are_available(sbx):
-    # A real shell, not exec of a bare argv - pipes have to work.
-    result = sbx.shell.run("printf 'b\\na\\nc\\n' | sort | tr '\\n' ' '")
+    # `bash -c` gives a real shell, so pipes and redirection work.
+    result = sbx.runner.run("printf 'b\\na\\nc\\n' | sort | tr '\\n' ' '")
     assert result.output.strip() == "a b c"
 
 
 def test_stdout_and_stderr_interleave_in_order(sbx):
-    # Merging with 2>&1 at capture time is what preserves this. Capturing the
-    # two streams separately destroys the relative ordering irrecoverably, so
-    # the decision can't be deferred to render time.
-    result = sbx.shell.run("echo one; echo two >&2; echo three")
+    # stderr is merged into stdout at the source; capturing them separately
+    # would destroy the relative ordering irrecoverably.
+    result = sbx.runner.run("echo one; echo two >&2; echo three")
     assert result.output.split() == ["one", "two", "three"]
 
 
-# ---- session persistence: the reason this isn't `docker exec` per call --
+# ---- statelessness: each command is independent -------------------------
 
 
-def test_cwd_persists_between_commands(sbx):
-    sbx.shell.run("mkdir -p /workspace/sub && cd /workspace/sub")
-    assert sbx.shell.run("pwd").output.strip() == "/workspace/sub"
+def test_cwd_does_not_persist_between_commands(sbx):
+    # No persistent shell: a `cd` in one command is gone by the next, which
+    # starts back at /workspace.
+    sbx.runner.run("cd /tmp")
+    assert sbx.runner.run("pwd").output.strip() == "/workspace"
 
 
-def test_environment_persists_between_commands(sbx):
-    sbx.shell.run("export MARKER=persisted")
-    assert "persisted" in sbx.shell.run("echo $MARKER").output
+def test_environment_does_not_persist_between_commands(sbx):
+    # An `export` in one command does not carry into the next.
+    sbx.runner.run("export MARKER=persisted")
+    assert "persisted" not in sbx.runner.run("echo [${MARKER}]").output
 
 
-# ---- the wrapper's defences ---------------------------------------------
+def test_the_filesystem_does_persist_between_commands(sbx):
+    # The container is durable even though the shell isn't: a file written in
+    # one command is there in the next.
+    sbx.runner.run("echo durable > /workspace/state.txt")
+    assert "durable" in sbx.runner.run("cat /workspace/state.txt").output
 
 
-def test_quoting_survives_the_file_round_trip(sbx):
-    # The command text is passed through a file precisely so that arbitrary
-    # quotes, newlines and backslashes need no escaping.
-    result = sbx.shell.run("""python3 -c 'print("quotes: \\"a\\" '"'"'b'"'"'")'""")
+def test_state_can_be_chained_within_one_command(sbx):
+    # The documented way to use working-directory state: chain it in a single
+    # command rather than relying on it sticking.
+    result = sbx.runner.run("mkdir -p /workspace/sub && cd /workspace/sub && pwd")
+    assert result.output.strip() == "/workspace/sub"
+
+
+# ---- command passing ----------------------------------------------------
+
+
+def test_quoting_survives_argv_passing(sbx):
+    # The command is passed as its own argv element, never spliced into a shell
+    # string, so arbitrary quotes and backslashes need no escaping.
+    result = sbx.runner.run("""python3 -c 'print("quotes: \\"a\\" '"'"'b'"'"'")'""")
     assert result.exit_code == 0
     assert "quotes: \"a\" 'b'" in result.output
 
 
-def test_syntax_error_does_not_wedge_the_session(sbx):
-    # Under `eval` this is an ordinary non-zero exit. Handed straight to bash
-    # it would abort the line before the sentinel printed, hanging the session
-    # over a typo.
-    broken = sbx.shell.run("if [ ; then")
+def test_syntax_error_is_an_ordinary_failure(sbx):
+    # A malformed command just makes its own bash exit non-zero; there is no
+    # shared session to wedge, and the next command is unaffected.
+    broken = sbx.runner.run("if [ ; then")
     assert broken.status == "completed"
     assert broken.exit_code != 0
-    assert sbx.shell.run("echo still-here").output.strip() == "still-here"
+    assert sbx.runner.run("echo still-here").output.strip() == "still-here"
 
 
-def test_shadowed_builtins_do_not_break_the_harness(sbx):
-    # An agent that defines printf/eval/cat as functions would otherwise break
-    # the wrapper silently: a shadowed printf swallows the sentinel (every
-    # later command looks hung), a shadowed eval makes commands appear to
-    # succeed while doing nothing.
-    result = sbx.shell.run(
-        "printf() { :; }; eval() { :; }; cat() { :; }; builtin echo shadowed-ok"
-    )
+def test_shell_fatal_settings_stay_contained(sbx):
+    # `set -e` then a failure ends this command's bash, but nothing else - the
+    # next command runs against a fresh process.
+    result = sbx.runner.run("set -e; false; echo unreachable", timeout=30)
     assert result.status == "completed"
-    assert "shadowed-ok" in result.output
-    assert sbx.shell.run("echo recovered").output.strip() == "recovered"
-
-
-@pytest.mark.parametrize(
-    "fatal_command",
-    [
-        "echo bye; exit 3",  # `exit` runs in the current shell, so it ends it
-        "set -e; false; echo unreachable",  # a shell-fatal setting, then a failure
-    ],
-)
-def test_session_fatal_commands_are_reported_not_hidden(sbx, fatal_command):
-    # These are ordinary agent behaviour, not pathology, and they genuinely
-    # kill bash. The contract is that the harness says so rather than looking
-    # like a hang, and that the next command works against a fresh session.
-    result = sbx.shell.run(fatal_command, timeout=30)
-    assert result.status == "session_lost"
-    assert result.exit_code is None
-    assert "restarted" in result.note
-    assert sbx.shell.run("echo back").output.strip() == "back"
-
-
-def test_output_produced_before_a_fatal_exit_survives(sbx):
-    # Losing the session must not lose what the command already printed - that
-    # output is often the only evidence of why it died.
-    result = sbx.shell.run("echo printed-before-exit; exit 1", timeout=30)
-    assert result.status == "session_lost"
-    assert "printed-before-exit" in result.output
+    assert result.exit_code != 0
+    assert "unreachable" not in result.output
+    assert sbx.runner.run("echo back").output.strip() == "back"
 
 
 # ---- long-running commands ----------------------------------------------
@@ -128,68 +113,67 @@ def test_output_produced_before_a_fatal_exit_survives(sbx):
 def test_timeout_leaves_the_command_running(sbx):
     # A timeout is a status, not a failure: the command keeps going and the
     # agent gets a snapshot plus the choice of what to do about it.
-    result = sbx.shell.run("for i in 1 2 3 4 5 6; do echo tick-$i; sleep 1; done", timeout=3)
+    result = sbx.runner.run("for i in 1 2 3 4 5 6; do echo tick-$i; sleep 1; done", timeout=3)
     assert result.status == "running"
     assert result.exit_code is None
     assert "tick-1" in result.output
-    sbx.shell.kill()
+    sbx.runner.kill()
 
 
 def test_wait_returns_only_new_output(sbx):
     # Repeated waits should read like `tail -f`, not re-send the whole log -
     # otherwise a long build would re-fill the context window every check.
-    first = sbx.shell.run("for i in 1 2 3 4 5 6; do echo tick-$i; sleep 1; done", timeout=3)
+    first = sbx.runner.run("for i in 1 2 3 4 5 6; do echo tick-$i; sleep 1; done", timeout=3)
     assert "tick-1" in first.output
-    later = sbx.shell.wait(timeout=2)
+    later = sbx.runner.wait(timeout=2)
     assert "tick-1" not in later.output
-    sbx.shell.kill()
+    sbx.runner.kill()
 
 
 def test_wait_returns_the_exit_code_once_the_command_finishes(sbx):
-    sbx.shell.run("echo start; sleep 3; echo finished", timeout=1)
-    result = sbx.shell.wait(timeout=60)
+    sbx.runner.run("echo start; sleep 3; echo finished", timeout=1)
+    result = sbx.runner.wait(timeout=60)
     assert result.status == "completed"
     assert result.exit_code == 0
     assert "finished" in result.output
 
 
 def test_starting_a_second_command_is_rejected(sbx):
-    sbx.shell.run("sleep 30", timeout=1)
-    rejected = sbx.shell.run("echo nope")
+    sbx.runner.run("sleep 30", timeout=1)
+    rejected = sbx.runner.run("echo nope")
     assert rejected.status == "rejected"
     # The rejection has to name the way out, or the agent is stuck.
     assert "shell_wait" in rejected.note and "shell_kill" in rejected.note
-    sbx.shell.kill()
+    sbx.runner.kill()
 
 
 def test_wait_with_nothing_running_is_rejected(sbx):
-    result = sbx.shell.wait()
+    result = sbx.runner.wait()
     assert result.status == "rejected"
     assert result.note == "no command is currently running"
 
 
 def test_kill_terminates_a_stuck_command(sbx):
-    sbx.shell.run("sleep 300", timeout=1)
-    result = sbx.shell.kill()
+    sbx.runner.run("sleep 300", timeout=1)
+    result = sbx.runner.kill()
     assert result.status == "killed"
     assert result.exit_code == 143  # 128 + SIGTERM
     assert "SIGTERM" in result.note
 
 
-def test_session_state_survives_a_kill(sbx):
-    # Killing the command must not cost the agent its shell: only the child is
-    # signalled, never the shell itself.
-    sbx.shell.run("mkdir -p /workspace/keep && cd /workspace/keep")
-    sbx.shell.run("sleep 300", timeout=1)
-    sbx.shell.kill()
-    assert sbx.shell.run("pwd").output.strip() == "/workspace/keep"
+def test_a_new_command_works_after_a_kill(sbx):
+    # Killing frees the runner so the next command runs normally.
+    sbx.runner.run("sleep 300", timeout=1)
+    sbx.runner.kill()
+    assert sbx.runner.run("echo recovered").output.strip() == "recovered"
 
 
 # ---- isolation ----------------------------------------------------------
 
+
 def test_container_has_no_network(sbx):
     # If this ever passes, the agent can exfiltrate whatever it can read.
-    result = sbx.shell.run(
+    result = sbx.runner.run(
         "python3 -c \"import socket; socket.create_connection(('1.1.1.1', 80), timeout=5)\"",
         timeout=60,
     )
@@ -197,60 +181,15 @@ def test_container_has_no_network(sbx):
     assert result.exit_code != 0, "the container reached the network - isolation has regressed"
 
 
-def test_out_file_symlink_cannot_leak_a_host_file(tmp_path):
-    # The harness scratch dir is bind-mounted into the container, so the agent
-    # can see its out-file and replace it with a symlink to a host path. The
-    # harness must read the output it captured, never whatever that name now
-    # resolves to - otherwise the tool result becomes an arbitrary host-file
-    # read, straight back to the model, with no network required.
-    secret = tmp_path / "host_only_secret.txt"  # outside the workspace
-    secret.write_text("HOST-SECRET-THE-AGENT-MUST-NOT-SEE\n")
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-
-    with Sandbox(workspace) as sandbox:
-        result = sandbox.shell.run(
-            "T=$(ls /harness | grep '^out_'); "
-            f"ln -sf {secret} /harness/$T; "
-            "echo the-real-output"
-        )
-    assert "HOST-SECRET" not in result.output, "harness followed the symlink to a host file"
-    assert "the-real-output" in result.output
-
-
-def test_out_file_redirect_attempt_is_detected(tmp_path):
-    # Blocking the leak is the safety guarantee; recording the attempt is the
-    # audit signal on top of it. An ordinary command must not register, and the
-    # redirect must, with the host path the agent aimed at.
-    secret = tmp_path / "host_only_secret.txt"
-    secret.write_text("HOST-SECRET-THE-AGENT-MUST-NOT-SEE\n")
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-
-    with Sandbox(workspace) as sandbox:
-        sandbox.shell.run("echo an ordinary command")
-        assert sandbox.tamper_events == [], "a benign command was flagged as tampering"
-
-        sandbox.shell.run(
-            "T=$(ls /harness | grep '^out_'); "
-            f"ln -sf {secret} /harness/$T; "
-            "echo hi"
-        )
-        assert any(str(secret) in target for target in sandbox.tamper_events), (
-            f"redirect to {secret} was not detected; events={sandbox.tamper_events}"
-        )
-
-
 # ---- writing files ------------------------------------------------------
 
 
 def test_heredoc_writes_exact_content(sbx):
-    # The shell is the only way to create a file, so byte fidelity is a
-    # guarantee this harness has to make. Passing command text through a file
-    # is what allows a quoted heredoc to carry content that would otherwise be
-    # mangled by expansion.
+    # Writing a file goes through the shell; byte fidelity is a guarantee this
+    # harness makes. Passing the command as its own argv element is what lets a
+    # quoted heredoc carry content that expansion would otherwise mangle.
     content = '#!/bin/sh\nname="$USER and `whoami`"\necho \'single\' "double" \\back\n'
-    result = sbx.shell.run(
+    result = sbx.runner.run(
         f"mkdir -p /workspace/gen && cat > /workspace/gen/f.sh <<'XEOF'\n{content}XEOF\n"
     )
     assert result.exit_code == 0
@@ -264,8 +203,8 @@ def test_workspace_outlives_the_container(tmp_path):
     # The workspace is the measured artifact; the container is disposable.
     # Needs its own sandbox because it asserts on state after teardown.
     with Sandbox(tmp_path) as sandbox:
-        sandbox.shell.run("echo by-the-shell > /workspace/generated.txt")
-        sandbox.shell.run("mkdir -p /workspace/sub && echo nested > /workspace/sub/deep.txt")
+        sandbox.runner.run("echo by-the-shell > /workspace/generated.txt")
+        sandbox.runner.run("mkdir -p /workspace/sub && echo nested > /workspace/sub/deep.txt")
 
     assert (tmp_path / "generated.txt").read_text().strip() == "by-the-shell"
     assert (tmp_path / "sub/deep.txt").read_text().strip() == "nested"

@@ -52,8 +52,9 @@ def pytest_collection_modifyitems(config, items):
 def sbx(tmp_path_factory):
     """One container for the whole run.
 
-    A fresh container per test would be cleaner but takes seconds each; the
-    `_reset_session` fixture below buys back the isolation for far less.
+    A fresh container per test would be cleaner but takes seconds each. Commands
+    carry no session state between calls, so the only thing that can leak across
+    tests is a command left running; `_free_runner` clears that.
     """
     workspace = tmp_path_factory.mktemp("workspace")
     with Sandbox(workspace) as sandbox:
@@ -61,22 +62,17 @@ def sbx(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
-def _reset_session(request):
-    """Undo session state a test leaves behind.
+def _free_runner(request):
+    """Kill any command a test left running, so the next test isn't rejected.
 
-    Because the container is shared, cwd, exported variables and shell
-    functions would otherwise leak into whatever runs next, making tests
-    order-dependent and failures hard to localise. A test that fails
-    mid-command also leaves one pending, so kill that first or the reset
-    itself would be rejected.
+    There is no shell session to reset - each command is independent - so this
+    only has to clear a still-running command (e.g. a test that returned without
+    killing one, or failed mid-command).
     """
     yield
 
     if "sbx" not in request.fixturenames:
         return  # a test that never touched the container
-    shell = request.getfixturevalue("sbx").shell
-    if shell is None:
-        return
-    if shell._pending is not None:
-        shell.kill()
-    shell.run("cd /workspace; unset -f printf eval cat; unset MARKER", timeout=30)
+    runner = request.getfixturevalue("sbx").runner
+    if runner is not None and runner._running is not None:
+        runner.kill()

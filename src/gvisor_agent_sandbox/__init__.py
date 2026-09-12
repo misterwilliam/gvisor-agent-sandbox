@@ -9,7 +9,7 @@ callers can write `from gvisor_agent_sandbox import Sandbox`. Private helpers
 from .sandbox import (
     DEFAULT_IMAGE,
     MAX_OUTPUT_BYTES,
-    PersistentShell,
+    CommandRunner,
     Sandbox,
     SandboxError,
     ShellResult,
@@ -18,7 +18,7 @@ from .sandbox import (
 __all__ = [
     "DEFAULT_IMAGE",
     "MAX_OUTPUT_BYTES",
-    "PersistentShell",
+    "CommandRunner",
     "Sandbox",
     "SandboxError",
     "ShellResult",

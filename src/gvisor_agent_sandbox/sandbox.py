@@ -1,47 +1,48 @@
 """Agentic sandbox: a gVisor-isolated container an agent drives through tools.
 
-- One container per Sandbox instance (not per command), so installed
-  packages, files, and background processes survive across calls.
-- One long-lived bash process per Sandbox, so cwd, environment variables,
-  shell functions, and aliases survive too. `cd /workspace/build` in one call
-  is still in effect on the next, and `source venv/bin/activate` actually
-  sticks.
+The container is durable - one per Sandbox, so the filesystem, installed
+packages, and any backgrounded processes persist across calls. Each command,
+though, runs as its own `docker exec`; there is no persistent shell holding
+working-directory or environment state between calls.
 
     with Sandbox("/path/to/empty/workspace") as sbx:
         sbx.shell_exec("cd /workspace && python3 -m venv venv")
-        sbx.shell_exec("source venv/bin/activate")
-        sbx.shell_exec("pip install pytest")   # goes into the venv
+        sbx.shell_exec("/workspace/venv/bin/python -c 'import sys; print(sys.prefix)'")
+
+That trade is deliberate. A human leans hard on a persistent shell (cwd,
+`export`, `source venv/bin/activate` all sticking); an agent does not need it -
+it can emit absolute paths and chain state within one command - and dropping
+the persistent shell removes the whole completion-detection problem it created.
+Because each command is its own process, "done" is just the process exiting,
+output comes straight off that process's pipe, and there is no host-side file
+channel for command text or output (and so none of the attack surface one
+brings).
 
 A command that outruns its timeout is not an error. It stays running and the
 agent gets the output so far, then decides whether to keep waiting
-(`shell_wait`) or stop it (`shell_kill`). A slow test suite and a hung
-process look identical to a fixed timeout but not to an agent holding the
-partial output, so the judgment belongs there.
+(`shell_wait`) or stop it (`shell_kill`). A slow test suite and a hung process
+look identical to a fixed timeout but not to an agent holding the partial
+output, so the judgment belongs there.
+
+Requires: docker, and the gVisor runtime registered as `runsc`. The invoking
+user must be in the `docker` group (no sudo needed - if you just added
+yourself, start a new shell for it to take effect).
 """
 
-import logging
 import os
-import queue
-import shutil
-import stat
 import subprocess
-import tempfile
 import threading
 import time
-import uuid
 from pathlib import Path
-
-logger = logging.getLogger(__name__)
 
 # Full python image (not -slim) is based on buildpack-deps, so it ships gcc,
 # make, and friends - enough for "write a C compiler"-shaped tasks without a
 # custom image.
 DEFAULT_IMAGE = "python:3.12"
 
-# Where the harness scratch mount lands inside the container. Deliberately
-# NOT under /workspace: the workspace is the measured artifact and shouldn't
-# be polluted with command text and captured output.
-SCRATCH_GUEST = "/harness"
+# The container's working directory, and where each command starts. The
+# workspace bind mount lands here; it is the measured artifact.
+WORKSPACE_GUEST = "/workspace"
 
 # Cap on how much output is handed back in a single result. Build and test
 # logs would otherwise dominate the context window over a long run.
@@ -49,7 +50,7 @@ MAX_OUTPUT_BYTES = 30_000
 
 
 class SandboxError(Exception):
-    """Raised when the container or shell fails to start."""
+    """Raised when the container fails to start."""
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
@@ -66,17 +67,17 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
 class ShellResult:
     """One command's outcome, in whatever state it's currently in.
 
-    `output` is stdout and stderr interleaved - see the note on 2>&1 in
-    PersistentShell for why they aren't kept apart. It contains only output
-    not already returned by an earlier call, so repeated `shell_wait`s read
-    like `tail -f` rather than re-sending the whole log each time.
+    `output` is stdout and stderr interleaved - captured with stderr merged
+    into stdout so their relative ordering (destroyed the moment the two are
+    read separately) is preserved. It contains only output not already returned
+    by an earlier call, so repeated `shell_wait`s read like `tail -f` rather
+    than re-sending the whole log each time.
 
     status:
-      completed    - finished on its own; exit_code is meaningful
-      running      - still going; the agent chooses wait or kill
-      killed       - terminated on request; exit_code is the signal's
-      session_lost - the shell died; container state is still intact
-      rejected     - the call didn't make sense in the current state
+      completed - finished on its own; exit_code is meaningful
+      running   - still going; the agent chooses wait or kill
+      killed    - terminated on request; exit_code is the signal's, if known
+      rejected  - the call didn't make sense in the current state
     """
 
     def __init__(
@@ -119,8 +120,6 @@ class ShellResult:
         parts = []
         if self.status == "killed":
             parts.append(f"killed (exit={self.exit_code})")
-        elif self.status == "session_lost":
-            parts.append("session lost")
         else:
             parts.append(f"exit={self.exit_code}")
         if self.note:
@@ -129,24 +128,121 @@ class ShellResult:
         return "\n".join(parts)
 
 
-class _Pending:
-    """A command that was started and hasn't reported completion yet."""
+class _RunningCommand:
+    """One `docker exec` in flight, with a thread draining its output.
 
-    def __init__(self, token: str, marker: str, cmd_file: Path, out_file: Path, out_fd: int):
-        self.token = token
-        self.marker = marker
-        self.cmd_file = cmd_file
-        self.out_file = out_file
-        # A file descriptor opened on the out-file at creation, read through
-        # ever after. The agent can see /harness and can replace the out-file's
-        # directory entry with a symlink to a host path; re-opening by name
-        # would then follow it and hand a host file back as command output.
-        # A descriptor references the inode, not the name, so the swap is inert.
-        self.out_fd = out_fd
+    The command is launched as:
+
+        docker exec -w <cwd> <cid> bash -c 'echo "__PID__$$"; exec bash -c "$1" 2>&1' bash <command>
+
+    Three things earn that wrapper:
+
+    - The command is passed as its own argv element (`$1`), never spliced into
+      a shell string, so arbitrary quotes, newlines, and backslashes need no
+      escaping - the same guarantee the old file-passing gave, without a file.
+    - `echo "__PID__$$"` then `exec` prints the pid of the bash that (after the
+      exec, which preserves the pid) runs the command. That pid is what
+      `shell_kill` signals; it travels as the guaranteed-first output line,
+      which the reader strips before any command output can appear, so nothing
+      the command prints can be mistaken for it.
+    - `2>&1` merges stderr into stdout *inside the container*. `docker exec`
+      transports stdout and stderr as separate streams whose relative ordering
+      is lost in transit, so the merge has to happen at the source, before the
+      command's output leaves the container.
+
+    stdin is /dev/null: a command that reads stdin gets EOF rather than hanging.
+    A syntax error or a shell-fatal setting (`set -e` then a failure) just makes
+    this one bash exit non-zero - there is no shared session to wedge.
+    """
+
+    def __init__(self, container_id: str, proc: subprocess.Popen):
+        self.container_id = container_id
+        self.proc = proc
+        self.pid: int | None = None  # in-container pid of the command's bash
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
         self.started_at = time.monotonic()
         self.last_output_at = time.monotonic()
-        self.shown = 0  # characters of out_file already returned to the agent
-        self.tamper_target: str | None = None  # set once if the out-file entry is redirected
+        self.shown = 0  # characters already returned to the agent
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    @classmethod
+    def start(cls, container_id: str, cwd: str, command: str) -> "_RunningCommand":
+        proc = subprocess.Popen(
+            [
+                "docker", "exec", "-w", cwd, container_id,
+                "bash", "-c", 'echo "__PID__$$"; exec bash -c "$1" 2>&1', "bash", command,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            # The command's stderr is already merged into stdout inside the
+            # container (2>&1 above); this only folds in docker exec's own
+            # client-side diagnostics.
+            stderr=subprocess.STDOUT,
+        )
+        return cls(container_id, proc)
+
+    # ---- output ----------------------------------------------------------
+
+    def _reader(self) -> None:
+        assert self.proc.stdout is not None
+        fd = self.proc.stdout.fileno()
+        header = b""
+        pid_done = False
+        try:
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                if not pid_done:
+                    header += chunk
+                    nl = header.find(b"\n")
+                    if nl == -1:
+                        continue
+                    line, rest = header[:nl], header[nl + 1 :]
+                    if line.startswith(b"__PID__"):
+                        try:
+                            self.pid = int(line[len(b"__PID__") :].strip())
+                        except ValueError:
+                            self.pid = -1
+                    else:
+                        # No pid line (e.g. docker exec itself errored); treat
+                        # everything as output so the error still surfaces.
+                        self.pid = -1
+                        rest = header
+                    pid_done = True
+                    if rest:
+                        self._append(rest)
+                else:
+                    self._append(chunk)
+        except OSError:
+            pass
+        finally:
+            try:
+                self.proc.stdout.close()
+            except OSError:
+                pass
+
+    def _append(self, data: bytes) -> None:
+        with self._lock:
+            self._buffer += data
+            self.last_output_at = time.monotonic()
+
+    def drain(self) -> str:
+        """Return output not yet shown to the agent, advancing the cursor.
+
+        Decodes the whole buffer and slices by character so a multi-byte
+        sequence is never split at the cursor boundary.
+        """
+        with self._lock:
+            data = bytes(self._buffer).decode(errors="replace")
+        new = data[self.shown :]
+        if new:
+            self.shown = len(data)
+        return new
+
+    # ---- lifecycle -------------------------------------------------------
 
     @property
     def elapsed(self) -> float:
@@ -156,411 +252,160 @@ class _Pending:
     def idle(self) -> float:
         return time.monotonic() - self.last_output_at
 
-
-class PersistentShell:
-    """A single long-lived `bash` inside the container, driven over stdin.
-
-    Each command is executed as:
-
-        { builtin eval "$(</harness/cmd_TOK)" ; } </dev/null >/harness/out_TOK 2>&1
-        builtin printf '__DONE_TOK__%d\\n' $?
-
-    Design notes, each of which is load-bearing:
-
-    - The command text is passed through a *file*, so there is no shell
-      escaping to get wrong - arbitrary quotes, newlines, and backslashes in
-      the agent's command are handled verbatim.
-    - Every name in the wrapper is protected from function shadowing, because
-      an agent that defines `printf`, `eval`, or `cat` as a function would
-      otherwise break the harness silently rather than loudly:
-        * `builtin printf` - a shadowed `printf` would swallow the sentinel,
-          making every subsequent command look like a hang.
-        * `builtin eval` - a shadowed `eval` is worse: commands would appear
-          to succeed while doing nothing at all.
-        * `$(<file)` instead of `$(cat file)` - reads the file with bash's own
-          redirection, so there is no external `cat` to shadow (and no
-          process spawned).
-      Aliases are not a threat here; non-interactive bash has `expand_aliases`
-      off. Functions are.
-    - `eval` contains syntax errors. Handing malformed source straight to the
-      shell would abort the line before the sentinel printed, hanging the
-      session over a typo. Under eval it's an ordinary non-zero exit.
-    - A brace group `{ ...; }` runs in the *current* shell, so `cd` and
-      `export` persist. A subshell `( ... )` or a background `&` would
-      silently break that - this is the whole point of the class.
-    - Output is redirected to a file rather than flowing through the pipe, so
-      the pipe only ever carries a short sentinel: no large-output deadlock,
-      and no chance of command output being mistaken for the sentinel. It
-      also means a still-running command's output can be read at any moment,
-      which is what makes shell_wait possible.
-    - `2>&1` merges stderr into stdout deliberately. Relative ordering between
-      the two streams is destroyed the moment they are captured separately, so
-      this has to be decided here rather than at render time. Interleaved
-      output preserves which diagnostic belongs to which step, matches what a
-      human sees in a terminal, and avoids implying "stderr means error" -
-      plenty of tools write progress there. The exit code carries success or
-      failure.
-    - stdin is /dev/null so a command that reads stdin gets EOF instead of
-      eating the next command the harness writes.
-
-    Sessions die for reasons that are ordinary agent behavior, not pathology:
-    `set -e` followed by a failing command, or `set -o posix` followed by a
-    syntax error, both terminate bash outright (verified). Rather than trying
-    to enumerate and prevent these, the shell is simply restarted and the
-    result says so. Only session-layer state (cwd, env, functions) is lost;
-    files, packages, and background processes live in the container.
-    """
-
-    def __init__(self, container_id: str, scratch_host: Path, default_timeout: int = 60):
-        self.container_id = container_id
-        self.scratch_host = scratch_host
-        self.default_timeout = default_timeout
-        self._proc: subprocess.Popen | None = None
-        self._queue: queue.Queue = queue.Queue()
-        self._shell_pid: int | None = None
-        self._pending: _Pending | None = None
-        # Resolved host paths the agent tried to redirect a command's out-file
-        # at. The fd-based read makes these harmless, so this is an audit trail
-        # of attempts, not a list of leaks.
-        self.tamper_events: list[str] = []
-
-    # ---- lifecycle -------------------------------------------------------
-
-    def start(self) -> None:
-        self._proc = subprocess.Popen(
-            ["docker", "exec", "-i", self.container_id, "bash"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            # bash's own stderr (as opposed to the command's, which is
-            # redirected to a file) would only carry harness-level bugs.
-            stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-        )
-        self._queue = queue.Queue()
-        # The proc and queue are passed explicitly rather than read off self:
-        # after a restart, a lingering reader from the *previous* shell would
-        # otherwise push its EOF sentinel into the *new* session's queue and
-        # make a healthy shell look dead.
-        threading.Thread(
-            target=self._read_loop, args=(self._proc, self._queue), daemon=True
-        ).start()
-        self._shell_pid = self._probe_pid()
-
-    @staticmethod
-    def _read_loop(proc: subprocess.Popen, q: queue.Queue) -> None:
+    def wait_exit(self, timeout: float) -> int | None:
+        """Return the command's exit code if it finishes within `timeout`, else
+        None. `docker exec` propagates the exec'd process's exit code."""
         try:
-            if proc.stdout is not None:
-                for line in proc.stdout:
-                    q.put(line)
-        except Exception:
-            pass
-        finally:
-            q.put(None)  # EOF sentinel
+            self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            return None
+        self._thread.join(timeout=2)  # let the reader capture the last bytes
+        return self.proc.returncode
 
-    def alive(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+    def _await_pid(self, timeout: float) -> int | None:
+        deadline = time.monotonic() + timeout
+        while self.pid is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return self.pid
+
+    def signal(self, sig: str) -> None:
+        """Signal the in-container command by pid: its children (pkill -P) and
+        the command's bash itself. Falls back to killing the `docker exec`
+        client if the pid never arrived."""
+        pid = self._await_pid(2.0)
+        if pid and pid > 0:
+            subprocess.run(
+                [
+                    "docker", "exec", self.container_id, "bash", "-c",
+                    f"pkill -{sig} -P {pid} 2>/dev/null; kill -{sig} {pid} 2>/dev/null; true",
+                ],
+                capture_output=True,
+            )
+        else:
+            try:
+                self.proc.terminate() if sig == "TERM" else self.proc.kill()
+            except OSError:
+                pass
 
     def close(self) -> None:
-        if self._proc is None:
-            return
+        """Make sure the exec client and its reader are gone."""
         try:
-            if self._proc.stdin:
-                self._proc.stdin.close()
-            self._proc.wait(timeout=5)
-        except Exception:
-            self._proc.kill()
-        self._proc = None
-
-    def _probe_pid(self) -> int | None:
-        """Ask the shell for its own PID, needed to target its children when
-        killing a running command."""
-        token = uuid.uuid4().hex[:8]
-        marker = f"__PID_{token}__"
-        try:
-            self._write(f"builtin printf '{marker}%d\\n' $$\n")
-        except Exception:
-            return None
-        deadline = time.monotonic() + 10
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             try:
-                line = self._queue.get(timeout=remaining)
-            except queue.Empty:
-                return None
-            if line is None:
-                return None
-            if line.startswith(marker):
-                try:
-                    return int(line[len(marker) :].strip())
-                except ValueError:
-                    return None
+                self.proc.kill()
+            except OSError:
+                pass
+        self._thread.join(timeout=2)
 
-    def _write(self, text: str) -> None:
-        if self._proc is None or self._proc.stdin is None:
-            raise SandboxError("shell is not running")
-        self._proc.stdin.write(text)
-        self._proc.stdin.flush()
 
-    # ---- the three operations -------------------------------------------
+class CommandRunner:
+    """Runs one command at a time in the container, tracking the running one so
+    it can be waited on or killed. Holds no shell state - each command is an
+    independent `docker exec`."""
+
+    def __init__(self, container_id: str, cwd: str = WORKSPACE_GUEST, default_timeout: int = 60):
+        self.container_id = container_id
+        self.cwd = cwd
+        self.default_timeout = default_timeout
+        self._running: _RunningCommand | None = None
 
     def run(self, command: str, timeout: int | None = None) -> ShellResult:
         timeout = timeout if timeout is not None else self.default_timeout
-
-        if self._pending is not None:
+        if self._running is not None:
             return ShellResult(
                 status="rejected",
                 note=(
-                    f"a command has been running for {self._pending.elapsed:.0f}s. "
+                    f"a command has been running for {self._running.elapsed:.0f}s. "
                     "Use shell_wait to keep waiting or shell_kill to stop it before "
                     "running something else."
                 ),
             )
-
-        if not self.alive():
-            self.start()
-
-        token = uuid.uuid4().hex[:12]
-        cmd_file = self.scratch_host / f"cmd_{token}"
-        out_file = self.scratch_host / f"out_{token}"
-        cmd_file.write_text(command)
-        # O_EXCL: we must be the file's creator. Bash's `> out_file` then
-        # truncates this same inode, so the descriptor we hold and the one bash
-        # writes through point at the same file - and stay pointed at it even if
-        # the agent later swaps the directory entry for a symlink (see _drain).
-        out_fd = os.open(out_file, os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o600)
-
-        marker = f"__DONE_{token}__"
-        script = (
-            f'{{ builtin eval "$(<{SCRATCH_GUEST}/cmd_{token})" ; }} '
-            f"</dev/null >{SCRATCH_GUEST}/out_{token} 2>&1\n"
-            f"builtin printf '{marker}%d\\n' $?\n"
-        )
-
-        try:
-            self._write(script)
-        except (BrokenPipeError, SandboxError):
-            os.close(out_fd)
-            self.start()
-            return ShellResult(
-                status="session_lost",
-                note="the shell session had ended and was restarted; cwd and environment were reset",
-            )
-
-        self._pending = _Pending(token, marker, cmd_file, out_file, out_fd)
+        self._running = _RunningCommand.start(self.container_id, self.cwd, command)
         return self._settle(timeout)
 
     def wait(self, timeout: int | None = None) -> ShellResult:
         timeout = timeout if timeout is not None else self.default_timeout
-        if self._pending is None:
+        if self._running is None:
             return ShellResult(status="rejected", note="no command is currently running")
         return self._settle(timeout)
 
     def kill(self) -> ShellResult:
-        if self._pending is None:
+        if self._running is None:
             return ShellResult(status="rejected", note="no command is currently running")
 
-        pending = self._pending
-        elapsed = pending.elapsed
-
-        # TERM first, then KILL. Only direct children of the shell are
-        # targeted; grandchildren (make -> gcc) can survive as orphans, which
-        # is tolerable because the container is the real boundary and is
-        # disposable.
-        for signal, grace in (("TERM", 5), ("KILL", 5)):
-            self._kill_children(signal)
-            code = self._poll_for(pending.marker, grace)
+        rc = self._running
+        elapsed = rc.elapsed
+        # TERM first, then KILL. Grandchildren (make -> gcc) can survive as
+        # orphans, which is tolerable because the container is the real boundary
+        # and is disposable.
+        for sig, grace in (("TERM", 5), ("KILL", 5)):
+            rc.signal(sig)
+            code = rc.wait_exit(grace)
             if code is not None:
-                output = self._drain(pending)
-                self._finish(pending)
+                output = rc.drain()
+                self._finish()
                 return ShellResult(
-                    output,
-                    exit_code=code,
-                    status="killed",
-                    note=f"SIG{signal} after {elapsed:.0f}s",
+                    output, exit_code=code, status="killed", note=f"SIG{sig} after {elapsed:.0f}s"
                 )
 
-        # Neither signal produced a sentinel: the session itself is wedged.
-        output = self._drain(pending)
-        self._finish(pending)
-        self.close()
-        self.start()
+        # The in-container process is unkillable via signals (should not happen
+        # under gVisor); drop the exec client and move on.
+        output = rc.drain()
+        rc.close()
+        self._running = None
         return ShellResult(
-            output,
-            status="session_lost",
-            note=(
-                f"the command could not be killed after {elapsed:.0f}s, so the shell "
-                "session was restarted; cwd and environment were reset, but files, "
-                "packages, and background processes are intact"
-            ),
+            output, status="killed", note=f"could not confirm exit after {elapsed:.0f}s"
         )
+
+    def close(self) -> None:
+        """Kill any in-flight command; called on sandbox teardown."""
+        if self._running is not None:
+            self._running.signal("KILL")
+            self._running.close()
+            self._running = None
 
     # ---- internals -------------------------------------------------------
 
     def _settle(self, timeout: int) -> ShellResult:
-        """Poll the pending command; either it completes, the session dies, or
-        it's still running and the agent gets a snapshot."""
-        assert self._pending is not None
-        pending = self._pending
-
-        code = self._poll_for(pending.marker, timeout)
+        rc = self._running
+        assert rc is not None
+        code = rc.wait_exit(timeout)
         if code is not None:
-            output = self._drain(pending)
-            self._finish(pending)
+            output = rc.drain()
+            self._finish()
             return ShellResult(output, exit_code=code, status="completed")
+        return ShellResult(rc.drain(), status="running", elapsed=rc.elapsed, idle=rc.idle)
 
-        if not self.alive():
-            output = self._drain(pending)
-            self._finish(pending)
-            self.start()
-            return ShellResult(
-                output,
-                status="session_lost",
-                note=(
-                    "the shell session ended while this command was running (a shell-fatal "
-                    "setting such as `set -e` will do this) and was restarted; cwd and "
-                    "environment were reset, but files, packages, and background processes "
-                    "are intact"
-                ),
-            )
-
-        return ShellResult(
-            self._drain(pending),
-            status="running",
-            elapsed=pending.elapsed,
-            idle=pending.idle,
-        )
-
-    def _out_file_redirect_target(self, pending: _Pending) -> str | None:
-        """If the out-file's directory entry no longer names the file we
-        created, return where it now points, else None.
-
-        The harness only ever writes regular files into the scratch dir, so a
-        symlink there - or an entry whose inode differs from the one we hold
-        open - is the agent redirecting our read at a host path. Detection is
-        by effect, not by inspecting the command, so it does not care how the
-        redirect was written (`ln`, `mv`, `python -c`, a compiled helper). It
-        is a point-in-time check and a backgrounded flip-flop could dodge it;
-        that is acceptable because the fd-based read is what makes the redirect
-        harmless, and this is only the audit signal layered on top.
-        """
-        try:
-            entry = os.lstat(pending.out_file)  # the name, not followed
-        except OSError:
-            return None
-        if stat.S_ISLNK(entry.st_mode):
-            try:
-                return os.readlink(pending.out_file)
-            except OSError:
-                return "<unreadable symlink>"
-        try:
-            if entry.st_ino != os.fstat(pending.out_fd).st_ino:
-                return "<entry replaced>"
-        except OSError:
-            return None
-        return None
-
-    def _drain(self, pending: _Pending) -> str:
-        """Return output not yet shown to the agent, advancing the cursor.
-
-        Reads through the descriptor opened at creation, never by re-opening the
-        path: the out-file lives in a mount the agent can write, so resolving it
-        by name would follow a symlink the agent had pointed at a host file.
-        """
-        if pending.tamper_target is None:
-            target = self._out_file_redirect_target(pending)
-            if target is not None:
-                pending.tamper_target = target
-                self.tamper_events.append(target)
-                logger.warning(
-                    "a command's out-file was redirected to %r - the agent tried to "
-                    "read a host path through the harness (blocked by the held fd)",
-                    target,
-                )
-
-        try:
-            size = os.fstat(pending.out_fd).st_size
-            raw = os.pread(pending.out_fd, size, 0) if size else b""
-        except OSError:
-            return ""
-        data = raw.decode(errors="replace")
-        new = data[pending.shown :]
-        if new:
-            pending.shown = len(data)
-            pending.last_output_at = time.monotonic()
-        return new
-
-    def _finish(self, pending: _Pending) -> None:
-        try:
-            os.close(pending.out_fd)
-        except OSError:
-            pass
-        for f in (pending.cmd_file, pending.out_file):
-            f.unlink(missing_ok=True)
-        self._pending = None
-
-    def _kill_children(self, signal: str) -> bool:
-        if self._shell_pid is None:
-            return False
-        result = subprocess.run(
-            [
-                "docker", "exec", self.container_id,
-                "pkill", f"-{signal}", "-P", str(self._shell_pid),
-            ],
-            capture_output=True,
-            text=True,
-        )
-        # pkill exits 1 when nothing matched, 127 if it isn't installed.
-        return result.returncode in (0, 1)
-
-    def _poll_for(self, marker: str, timeout: float) -> int | None:
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            try:
-                line = self._queue.get(timeout=remaining)
-            except queue.Empty:
-                return None
-            if line is None:  # shell EOF
-                return None
-            if line.startswith(marker):
-                try:
-                    return int(line[len(marker) :].strip())
-                except ValueError:
-                    return -1
-            # Any other line is a harness-level bug (bash complaining about
-            # our wrapper); ignore it rather than corrupting the result.
+    def _finish(self) -> None:
+        if self._running is not None:
+            self._running.close()
+            self._running = None
 
 
 class Sandbox:
-    """A running gVisor container with a bind-mounted workspace and a
-    persistent shell.
+    """A running gVisor container with a bind-mounted workspace.
 
-    The workspace directory is the artifact - it lives on the host and
-    survives after the container is removed.
+    The workspace directory is the artifact - it lives on the host and survives
+    after the container is removed. Commands run one at a time via CommandRunner.
     """
 
-    _SESSION_NOTE = (
-        "Your working directory, environment variables, and shell functions persist "
-        "between calls. Files, installed packages, and background processes live in the "
-        "container and survive even if the shell session restarts. If the session ends "
-        "unexpectedly (for example, a command runs `set -e` and then fails), it restarts "
-        "automatically and the result will say so - your files and packages are "
-        "unaffected, but you may need to `cd` again."
+    _EXEC_NOTE = (
+        "Each call runs independently: the working directory resets to /workspace and "
+        "environment variables set in one call do not carry over to the next. The "
+        "filesystem, installed packages, and backgrounded processes do persist, since the "
+        "container is durable. To use state within a single command, chain it - e.g. "
+        "'cd src && make' - or use absolute paths (e.g. /workspace/venv/bin/python)."
     )
 
     TOOLS = [
         {
             "name": "shell_exec",
             "description": (
-                "Run a command in a persistent bash session inside your container. Returns "
-                "the exit code and the command's output, with stdout and stderr interleaved "
-                "as they would appear in a terminal. Your workspace is at /workspace.\n\n"
-                + _SESSION_NOTE
+                "Run a command in your container. Returns the exit code and the command's "
+                "output, with stdout and stderr interleaved as they would appear in a "
+                "terminal. Your workspace is at /workspace.\n\n"
+                + _EXEC_NOTE
                 + "\n\nIf the command is still running when the timeout expires, you get the "
                 "output so far instead of an error - the command keeps running. Use "
                 "shell_wait to keep waiting or shell_kill to stop it. You cannot start "
@@ -606,8 +451,7 @@ class Sandbox:
             "description": (
                 "Terminate the command that is currently running. Sends SIGTERM, then "
                 "SIGKILL if that does not work. Returns any remaining output and the exit "
-                "status. The shell session itself survives, so your working directory and "
-                "environment are preserved."
+                "status. The container and its filesystem are unaffected."
             ),
             "input_schema": {"type": "object", "properties": {}, "required": []},
         },
@@ -631,16 +475,13 @@ class Sandbox:
         self.exec_timeout = exec_timeout
         self.run_as_host_user = run_as_host_user
         self.container_id: str | None = None
-        self.scratch_host: Path | None = None
-        self.shell: PersistentShell | None = None
+        self.runner: CommandRunner | None = None
 
     def start(self) -> None:
         if not self.workspace.is_dir():
             raise SandboxError(f"{self.workspace} is not a directory")
         if any(self.workspace.iterdir()):
             raise SandboxError(f"{self.workspace} is not empty - workspace must start clean")
-
-        self.scratch_host = Path(tempfile.mkdtemp(prefix="sandbox-scratch-"))
 
         cmd = [
             "docker", "run", "-d", "--rm",
@@ -653,9 +494,8 @@ class Sandbox:
             "--memory", self.memory,
             "--cpus", self.cpus,
             "--pids-limit", str(self.pids_limit),
-            "-v", f"{self.workspace}:/workspace",
-            "-v", f"{self.scratch_host}:{SCRATCH_GUEST}",
-            "-w", "/workspace",
+            "-v", f"{self.workspace}:{WORKSPACE_GUEST}",
+            "-w", WORKSPACE_GUEST,
         ]
         if self.run_as_host_user:
             # Files the agent creates end up owned by the host user rather than
@@ -666,23 +506,17 @@ class Sandbox:
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            shutil.rmtree(self.scratch_host, ignore_errors=True)
             raise SandboxError(f"failed to start container: {result.stderr.strip()}")
         self.container_id = result.stdout.strip()
-
-        self.shell = PersistentShell(self.container_id, self.scratch_host, self.exec_timeout)
-        self.shell.start()
+        self.runner = CommandRunner(self.container_id, WORKSPACE_GUEST, self.exec_timeout)
 
     def stop(self) -> None:
-        if self.shell is not None:
-            self.shell.close()
-            self.shell = None
+        if self.runner is not None:
+            self.runner.close()
+            self.runner = None
         if self.container_id is not None:
             subprocess.run(["docker", "rm", "-f", self.container_id], capture_output=True, text=True)
             self.container_id = None
-        if self.scratch_host is not None:
-            shutil.rmtree(self.scratch_host, ignore_errors=True)
-            self.scratch_host = None
 
     def __enter__(self) -> "Sandbox":
         self.start()
@@ -691,33 +525,22 @@ class Sandbox:
     def __exit__(self, *_exc) -> None:
         self.stop()
 
-    @property
-    def tamper_events(self) -> list[str]:
-        """Host paths the agent tried to redirect command out-files at, in order.
-
-        Empty in normal use. Non-empty means the agent attempted to read a host
-        file through the harness (the attempt is blocked; this is the audit
-        trail). A caller enforcing a policy can poll this and tear the sandbox
-        down; a caller studying agent behaviour can log it and continue.
-        """
-        return list(self.shell.tamper_events) if self.shell is not None else []
-
     # ---- tool implementations -------------------------------------------
 
     def shell_exec(self, command: str, timeout: int | None = None) -> str:
-        if self.shell is None:
+        if self.runner is None:
             return "ERROR: sandbox is not running"
-        return self.shell.run(command, timeout).render()
+        return self.runner.run(command, timeout).render()
 
     def shell_wait(self, timeout: int | None = None) -> str:
-        if self.shell is None:
+        if self.runner is None:
             return "ERROR: sandbox is not running"
-        return self.shell.wait(timeout).render()
+        return self.runner.wait(timeout).render()
 
     def shell_kill(self) -> str:
-        if self.shell is None:
+        if self.runner is None:
             return "ERROR: sandbox is not running"
-        return self.shell.kill().render()
+        return self.runner.kill().render()
 
     def dispatch(self, tool_name: str, tool_input: dict) -> str:
         """Route a tool_use block to the matching method."""
