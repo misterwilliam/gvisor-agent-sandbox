@@ -49,6 +49,177 @@ WORKSPACE_GUEST = "/workspace"
 MAX_OUTPUT_BYTES = 30_000
 
 
+
+class Sandbox:
+    """A running gVisor container with a bind-mounted workspace.
+
+    The workspace directory is the artifact - it lives on the host and survives
+    after the container is removed. Commands run one at a time via CommandRunner.
+    """
+
+    _EXEC_NOTE = (
+        "Each call runs independently: the working directory resets to /workspace and "
+        "environment variables set in one call do not carry over to the next. The "
+        "filesystem, installed packages, and backgrounded processes do persist, since the "
+        "container is durable. To use state within a single command, chain it - e.g. "
+        "'cd src && make' - or use absolute paths (e.g. /workspace/venv/bin/python)."
+    )
+
+    TOOLS = [
+        {
+            "name": "shell_exec",
+            "description": (
+                "Run a command in your container. Returns the exit code and the command's "
+                "output, with stdout and stderr interleaved as they would appear in a "
+                "terminal. Your workspace is at /workspace.\n\n"
+                + _EXEC_NOTE
+                + "\n\nIf the command is still running when the timeout expires, you get the "
+                "output so far instead of an error - the command keeps running. Use "
+                "shell_wait to keep waiting or shell_kill to stop it. You cannot start "
+                "another command until the running one finishes or is killed."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Command to run, e.g. 'make test' or 'cd src && ls'.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Seconds to wait before reporting back. Default 60.",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+        {
+            "name": "shell_wait",
+            "description": (
+                "Keep waiting for the command that is currently running. Returns any output "
+                "produced since the last call, plus how long the command has been running "
+                "and whether it is still producing output - a build that is still printing "
+                "is progressing, while one that has been silent for a long time may be "
+                "stuck. If the command finishes, you get its exit code."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Additional seconds to wait. Default 60.",
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "shell_kill",
+            "description": (
+                "Terminate the command that is currently running. Sends SIGTERM, then "
+                "SIGKILL if that does not work. Returns any remaining output and the exit "
+                "status. The container and its filesystem are unaffected."
+            ),
+            "input_schema": {"type": "object", "properties": {}, "required": []},
+        },
+    ]
+
+    def __init__(
+        self,
+        workspace: str | Path,
+        image: str = DEFAULT_IMAGE,
+        memory: str = "2g",
+        cpus: str = "2",
+        pids_limit: int = 512,
+        exec_timeout: int = 60,
+        run_as_host_user: bool = True,
+    ):
+        self.workspace = Path(workspace).resolve()
+        self.image = image
+        self.memory = memory
+        self.cpus = cpus
+        self.pids_limit = pids_limit
+        self.exec_timeout = exec_timeout
+        self.run_as_host_user = run_as_host_user
+        self.container_id: str | None = None
+        self.runner: CommandRunner | None = None
+
+    def start(self) -> None:
+        if not self.workspace.is_dir():
+            raise SandboxError(f"{self.workspace} is not a directory")
+        if any(self.workspace.iterdir()):
+            raise SandboxError(f"{self.workspace} is not empty - workspace must start clean")
+
+        cmd = [
+            "docker", "run", "-d", "--rm",
+            "--runtime", "runsc",
+            # Not configurable. The threat model is a capable, possibly hostile
+            # agent; egress would let it exfiltrate data, reach a C2 host, or
+            # attack third parties from this machine - risks the syscall and
+            # filesystem boundaries do nothing about. `none` is the whole point.
+            "--network", "none",
+            "--memory", self.memory,
+            "--cpus", self.cpus,
+            "--pids-limit", str(self.pids_limit),
+            "-v", f"{self.workspace}:{WORKSPACE_GUEST}",
+            "-w", WORKSPACE_GUEST,
+        ]
+        if self.run_as_host_user:
+            # Files the agent creates end up owned by the host user rather than
+            # root, so the workspace can be archived/deleted without sudo. Cost:
+            # no apt-get inside the container (irrelevant under network=none).
+            cmd += ["--user", f"{os.getuid()}:{os.getgid()}"]
+        cmd += [self.image, "sleep", "infinity"]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise SandboxError(f"failed to start container: {result.stderr.strip()}")
+        self.container_id = result.stdout.strip()
+        self.runner = CommandRunner(self.container_id, WORKSPACE_GUEST, self.exec_timeout)
+
+    def stop(self) -> None:
+        if self.runner is not None:
+            self.runner.close()
+            self.runner = None
+        if self.container_id is not None:
+            subprocess.run(["docker", "rm", "-f", self.container_id], capture_output=True, text=True)
+            self.container_id = None
+
+    def __enter__(self) -> "Sandbox":
+        self.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.stop()
+
+    # ---- tool implementations -------------------------------------------
+
+    def shell_exec(self, command: str, timeout: int | None = None) -> str:
+        if self.runner is None:
+            return "ERROR: sandbox is not running"
+        return self.runner.run(command, timeout).render()
+
+    def shell_wait(self, timeout: int | None = None) -> str:
+        if self.runner is None:
+            return "ERROR: sandbox is not running"
+        return self.runner.wait(timeout).render()
+
+    def shell_kill(self) -> str:
+        if self.runner is None:
+            return "ERROR: sandbox is not running"
+        return self.runner.kill().render()
+
+    def dispatch(self, tool_name: str, tool_input: dict) -> str:
+        """Route a tool_use block to the matching method."""
+        if tool_name == "shell_exec":
+            return self.shell_exec(tool_input["command"], tool_input.get("timeout"))
+        if tool_name == "shell_wait":
+            return self.shell_wait(tool_input.get("timeout"))
+        if tool_name == "shell_kill":
+            return self.shell_kill()
+        return f"ERROR: unknown tool {tool_name!r}"
+
+
 class SandboxError(Exception):
     """Raised when the container fails to start."""
 
@@ -382,172 +553,3 @@ class CommandRunner:
             self._running.close()
             self._running = None
 
-
-class Sandbox:
-    """A running gVisor container with a bind-mounted workspace.
-
-    The workspace directory is the artifact - it lives on the host and survives
-    after the container is removed. Commands run one at a time via CommandRunner.
-    """
-
-    _EXEC_NOTE = (
-        "Each call runs independently: the working directory resets to /workspace and "
-        "environment variables set in one call do not carry over to the next. The "
-        "filesystem, installed packages, and backgrounded processes do persist, since the "
-        "container is durable. To use state within a single command, chain it - e.g. "
-        "'cd src && make' - or use absolute paths (e.g. /workspace/venv/bin/python)."
-    )
-
-    TOOLS = [
-        {
-            "name": "shell_exec",
-            "description": (
-                "Run a command in your container. Returns the exit code and the command's "
-                "output, with stdout and stderr interleaved as they would appear in a "
-                "terminal. Your workspace is at /workspace.\n\n"
-                + _EXEC_NOTE
-                + "\n\nIf the command is still running when the timeout expires, you get the "
-                "output so far instead of an error - the command keeps running. Use "
-                "shell_wait to keep waiting or shell_kill to stop it. You cannot start "
-                "another command until the running one finishes or is killed."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Command to run, e.g. 'make test' or 'cd src && ls'.",
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "description": "Seconds to wait before reporting back. Default 60.",
-                    },
-                },
-                "required": ["command"],
-            },
-        },
-        {
-            "name": "shell_wait",
-            "description": (
-                "Keep waiting for the command that is currently running. Returns any output "
-                "produced since the last call, plus how long the command has been running "
-                "and whether it is still producing output - a build that is still printing "
-                "is progressing, while one that has been silent for a long time may be "
-                "stuck. If the command finishes, you get its exit code."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "timeout": {
-                        "type": "integer",
-                        "description": "Additional seconds to wait. Default 60.",
-                    },
-                },
-                "required": [],
-            },
-        },
-        {
-            "name": "shell_kill",
-            "description": (
-                "Terminate the command that is currently running. Sends SIGTERM, then "
-                "SIGKILL if that does not work. Returns any remaining output and the exit "
-                "status. The container and its filesystem are unaffected."
-            ),
-            "input_schema": {"type": "object", "properties": {}, "required": []},
-        },
-    ]
-
-    def __init__(
-        self,
-        workspace: str | Path,
-        image: str = DEFAULT_IMAGE,
-        memory: str = "2g",
-        cpus: str = "2",
-        pids_limit: int = 512,
-        exec_timeout: int = 60,
-        run_as_host_user: bool = True,
-    ):
-        self.workspace = Path(workspace).resolve()
-        self.image = image
-        self.memory = memory
-        self.cpus = cpus
-        self.pids_limit = pids_limit
-        self.exec_timeout = exec_timeout
-        self.run_as_host_user = run_as_host_user
-        self.container_id: str | None = None
-        self.runner: CommandRunner | None = None
-
-    def start(self) -> None:
-        if not self.workspace.is_dir():
-            raise SandboxError(f"{self.workspace} is not a directory")
-        if any(self.workspace.iterdir()):
-            raise SandboxError(f"{self.workspace} is not empty - workspace must start clean")
-
-        cmd = [
-            "docker", "run", "-d", "--rm",
-            "--runtime", "runsc",
-            # Not configurable. The threat model is a capable, possibly hostile
-            # agent; egress would let it exfiltrate data, reach a C2 host, or
-            # attack third parties from this machine - risks the syscall and
-            # filesystem boundaries do nothing about. `none` is the whole point.
-            "--network", "none",
-            "--memory", self.memory,
-            "--cpus", self.cpus,
-            "--pids-limit", str(self.pids_limit),
-            "-v", f"{self.workspace}:{WORKSPACE_GUEST}",
-            "-w", WORKSPACE_GUEST,
-        ]
-        if self.run_as_host_user:
-            # Files the agent creates end up owned by the host user rather than
-            # root, so the workspace can be archived/deleted without sudo. Cost:
-            # no apt-get inside the container (irrelevant under network=none).
-            cmd += ["--user", f"{os.getuid()}:{os.getgid()}"]
-        cmd += [self.image, "sleep", "infinity"]
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise SandboxError(f"failed to start container: {result.stderr.strip()}")
-        self.container_id = result.stdout.strip()
-        self.runner = CommandRunner(self.container_id, WORKSPACE_GUEST, self.exec_timeout)
-
-    def stop(self) -> None:
-        if self.runner is not None:
-            self.runner.close()
-            self.runner = None
-        if self.container_id is not None:
-            subprocess.run(["docker", "rm", "-f", self.container_id], capture_output=True, text=True)
-            self.container_id = None
-
-    def __enter__(self) -> "Sandbox":
-        self.start()
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        self.stop()
-
-    # ---- tool implementations -------------------------------------------
-
-    def shell_exec(self, command: str, timeout: int | None = None) -> str:
-        if self.runner is None:
-            return "ERROR: sandbox is not running"
-        return self.runner.run(command, timeout).render()
-
-    def shell_wait(self, timeout: int | None = None) -> str:
-        if self.runner is None:
-            return "ERROR: sandbox is not running"
-        return self.runner.wait(timeout).render()
-
-    def shell_kill(self) -> str:
-        if self.runner is None:
-            return "ERROR: sandbox is not running"
-        return self.runner.kill().render()
-
-    def dispatch(self, tool_name: str, tool_input: dict) -> str:
-        """Route a tool_use block to the matching method."""
-        if tool_name == "shell_exec":
-            return self.shell_exec(tool_input["command"], tool_input.get("timeout"))
-        if tool_name == "shell_wait":
-            return self.shell_wait(tool_input.get("timeout"))
-        if tool_name == "shell_kill":
-            return self.shell_kill()
-        return f"ERROR: unknown tool {tool_name!r}"
