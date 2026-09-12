@@ -11,8 +11,6 @@ automatically where Docker or gVisor is missing.
 """
 import pytest
 
-from gvisor_agent_sandbox import Sandbox
-
 pytestmark = pytest.mark.docker
 
 
@@ -52,9 +50,9 @@ def test_stdout_and_stderr_interleave_in_order(sbx):
 
 def test_cwd_does_not_persist_between_commands(sbx):
     # No persistent shell: a `cd` in one command is gone by the next, which
-    # starts back at /workspace.
+    # starts back at /root.
     sbx.runner.run("cd /tmp")
-    assert sbx.runner.run("pwd").output.strip() == "/workspace"
+    assert sbx.runner.run("pwd").output.strip() == "/root"
 
 
 def test_environment_does_not_persist_between_commands(sbx):
@@ -66,15 +64,15 @@ def test_environment_does_not_persist_between_commands(sbx):
 def test_the_filesystem_does_persist_between_commands(sbx):
     # The container is durable even though the shell isn't: a file written in
     # one command is there in the next.
-    sbx.runner.run("echo durable > /workspace/state.txt")
-    assert "durable" in sbx.runner.run("cat /workspace/state.txt").output
+    sbx.runner.run("echo durable > /root/state.txt")
+    assert "durable" in sbx.runner.run("cat /root/state.txt").output
 
 
 def test_state_can_be_chained_within_one_command(sbx):
     # The documented way to use working-directory state: chain it in a single
     # command rather than relying on it sticking.
-    result = sbx.runner.run("mkdir -p /workspace/sub && cd /workspace/sub && pwd")
-    assert result.output.strip() == "/workspace/sub"
+    result = sbx.runner.run("mkdir -p /root/sub && cd /root/sub && pwd")
+    assert result.output.strip() == "/root/sub"
 
 
 # ---- command passing ----------------------------------------------------
@@ -187,28 +185,14 @@ def test_container_has_no_network(sbx):
 def test_heredoc_writes_exact_content(sbx):
     # Writing a file goes through the shell; byte fidelity is a guarantee this
     # harness makes. Passing the command as its own argv element is what lets a
-    # quoted heredoc carry content that expansion would otherwise mangle.
+    # quoted heredoc carry content that expansion would otherwise mangle. With
+    # no host mount, the file is read back through the container, not the host.
     content = '#!/bin/sh\nname="$USER and `whoami`"\necho \'single\' "double" \\back\n'
-    result = sbx.runner.run(
-        f"mkdir -p /workspace/gen && cat > /workspace/gen/f.sh <<'XEOF'\n{content}XEOF\n"
+    write = sbx.runner.run(
+        f"mkdir -p /root/gen && cat > /root/gen/f.sh <<'XEOF'\n{content}XEOF\n"
     )
-    assert result.exit_code == 0
-    assert (sbx.workspace / "gen/f.sh").read_text() == content
-
-
-# ---- lifecycle ----------------------------------------------------------
-
-
-def test_workspace_outlives_the_container(tmp_path):
-    # The workspace is the measured artifact; the container is disposable.
-    # Needs its own sandbox because it asserts on state after teardown.
-    with Sandbox(tmp_path) as sandbox:
-        sandbox.runner.run("echo by-the-shell > /workspace/generated.txt")
-        sandbox.runner.run("mkdir -p /workspace/sub && echo nested > /workspace/sub/deep.txt")
-
-    assert (tmp_path / "generated.txt").read_text().strip() == "by-the-shell"
-    assert (tmp_path / "sub/deep.txt").read_text().strip() == "nested"
-    assert sandbox.container_id is None
+    assert write.exit_code == 0
+    assert sbx.runner.run("cat /root/gen/f.sh").output == content
 
 
 def test_rendered_output_is_what_the_agent_receives(sbx):

@@ -30,7 +30,8 @@ Reasons for choosing agent-outside:
    own audit log.
 3. **Artifact purity.** The measured artifact is the final state of the codebase. Inside,
    the harness, its venv, and its logs share the container, so separating agent output
-   from scaffolding takes care.
+   from scaffolding takes care. With the agent outside, the container holds only the
+   agent's own work, which is extracted separately.
 4. **Dev-loop friction.** Iterating on harness code means rebuilding an image rather than
    rerunning a script.
 
@@ -53,19 +54,22 @@ scanning output for it; process-per-command makes "done" simply the process exit
 **Starting the container**
 
 ```sh
-docker run -d --rm --runtime runsc --network none \
-  -v <workspace>:/workspace -w /workspace <image> sleep infinity
+docker run -d --rm --runtime runsc --network none -w /root <image> sleep infinity
 ```
 
-The container just idles on `sleep infinity`; it is the durable layer. `sleep infinity`
-runs as PID 1 inside it.
+Nothing from the host is mounted in, and there is no `--user`: the agent runs as root, and
+gVisor - whose sentry is itself deprivileged on the host - is the boundary. Root's home
+`/root` doubles as the workspace (it already exists and is writable), so no directory needs
+creating or chowning. The container just idles on `sleep infinity`; it is the durable
+layer, running as PID 1 inside. The work stays in the container's own filesystem and is
+extracted separately (e.g. `docker cp`).
 
 **Executing a command**
 
 Each command is one exec:
 
 ```sh
-docker exec -w /workspace <cid> bash -c 'echo "__PID__$$"; exec bash -c "$1" 2>&1' bash <command>
+docker exec -w /root <cid> bash -c 'echo "__PID__$$"; exec bash -c "$1" 2>&1' bash <command>
 ```
 
 - **Command as argv, not string.** `<command>` is passed as its own argument (`$1`), never

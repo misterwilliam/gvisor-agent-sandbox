@@ -5,10 +5,8 @@ milliseconds anywhere Python does, which makes it the half that can gate a
 pull request.
 """
 
-import pytest
-
 import gvisor_agent_sandbox
-from gvisor_agent_sandbox import Sandbox, SandboxError, ShellResult
+from gvisor_agent_sandbox import Sandbox, ShellResult
 
 # Private helpers aren't re-exported from the package root, so they come from
 # the module directly.
@@ -75,34 +73,18 @@ def test_running_without_output_reports_silence():
     assert "(nothing new)" in rendered
 
 
-# ---- startup preconditions ----------------------------------------------
-
-
-def test_workspace_must_exist(tmp_path):
-    with pytest.raises(SandboxError, match="is not a directory"):
-        Sandbox(tmp_path / "does-not-exist").start()
-
-
-def test_workspace_must_start_empty(tmp_path):
-    # Starting clean is what makes the workspace a trustworthy artifact: every
-    # file in it afterwards came from this run.
-    (tmp_path / "leftover.txt").write_text("from a previous run")
-    with pytest.raises(SandboxError, match="not empty"):
-        Sandbox(tmp_path).start()
-
-
 # ---- tool surface -------------------------------------------------------
 
 
-def test_tools_report_clearly_when_the_sandbox_is_not_running(tmp_path):
-    sandbox = Sandbox(tmp_path)
+def test_tools_report_clearly_when_the_sandbox_is_not_running():
+    sandbox = Sandbox()
     assert sandbox.shell_exec("echo hi") == "ERROR: sandbox is not running"
     assert sandbox.shell_wait() == "ERROR: sandbox is not running"
     assert sandbox.shell_kill() == "ERROR: sandbox is not running"
 
 
-def test_dispatch_rejects_an_unknown_tool(tmp_path):
-    assert Sandbox(tmp_path).dispatch("rm_rf", {}).startswith("ERROR: unknown tool")
+def test_dispatch_rejects_an_unknown_tool():
+    assert Sandbox().dispatch("rm_rf", {}).startswith("ERROR: unknown tool")
 
 
 def test_public_api_is_importable_from_the_package_root():
@@ -113,7 +95,7 @@ def test_public_api_is_importable_from_the_package_root():
         assert hasattr(gvisor_agent_sandbox, name), f"{name} is in __all__ but not exported"
 
 
-def test_every_advertised_tool_is_dispatchable(tmp_path):
+def test_every_advertised_tool_is_dispatchable():
     # Catches a tool being added to TOOLS - and so to the schema the model is
     # given - without being wired into dispatch, which would surface to the
     # agent as an unexplained error mid-task.
@@ -122,7 +104,7 @@ def test_every_advertised_tool_is_dispatchable(tmp_path):
         "shell_wait": {},
         "shell_kill": {},
     }
-    sandbox = Sandbox(tmp_path)
+    sandbox = Sandbox()
     for tool in Sandbox.TOOLS:
         assert tool["name"] in minimal_input, f"no test input for new tool {tool['name']!r}"
         assert "unknown tool" not in sandbox.dispatch(tool["name"], minimal_input[tool["name"]])

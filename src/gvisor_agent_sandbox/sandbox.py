@@ -1,13 +1,15 @@
 """Agentic sandbox: a gVisor-isolated container an agent drives through tools.
 
 The container is durable - one per Sandbox, so the filesystem, installed
-packages, and any backgrounded processes persist across calls. Each command,
-though, runs as its own `docker exec`; there is no persistent shell holding
-working-directory or environment state between calls.
+packages, and any backgrounded processes persist across calls. The agent runs
+as root, and its home directory /root doubles as the workspace; nothing from
+the host is mounted in, so the work lives inside the container until it is
+extracted separately. Each command runs as its own `docker exec`; there is no
+persistent shell holding working-directory or environment state between calls.
 
-    with Sandbox("/path/to/empty/workspace") as sbx:
-        sbx.shell_exec("cd /workspace && python3 -m venv venv")
-        sbx.shell_exec("/workspace/venv/bin/python -c 'import sys; print(sys.prefix)'")
+    with Sandbox() as sbx:
+        sbx.shell_exec("python3 -m venv venv")   # runs in /root, the workspace
+        sbx.shell_exec("/root/venv/bin/python -c 'import sys; print(sys.prefix)'")
 
 That trade is deliberate. A human leans hard on a persistent shell (cwd,
 `export`, `source venv/bin/activate` all sticking); an agent does not need it -
@@ -33,16 +35,17 @@ import os
 import subprocess
 import threading
 import time
-from pathlib import Path
 
 # Full python image (not -slim) is based on buildpack-deps, so it ships gcc,
 # make, and friends - enough for "write a C compiler"-shaped tasks without a
 # custom image.
 DEFAULT_IMAGE = "python:3.12"
 
-# The container's working directory, and where each command starts. The
-# workspace bind mount lands here; it is the measured artifact.
-WORKSPACE_GUEST = "/workspace"
+# The agent's home and working directory; each command starts here. The agent
+# runs as root, so /root already exists and is writable and doubles as the
+# workspace. Nothing from the host is mounted here - the work stays in the
+# container until it is extracted separately.
+WORKSPACE = "/root"
 
 # Cap on how much output is handed back in a single result. Build and test
 # logs would otherwise dominate the context window over a long run.
@@ -51,18 +54,20 @@ MAX_OUTPUT_BYTES = 30_000
 
 
 class Sandbox:
-    """A running gVisor container with a bind-mounted workspace.
+    """A running gVisor container the agent drives through tools.
 
-    The workspace directory is the artifact - it lives on the host and survives
-    after the container is removed. Commands run one at a time via CommandRunner.
+    The agent runs as root with /root as its home and workspace. Nothing from
+    the host is mounted in; the container's own filesystem holds the work, and
+    results are extracted from it separately. Commands run one at a time via
+    CommandRunner.
     """
 
     _EXEC_NOTE = (
-        "Each call runs independently: the working directory resets to /workspace and "
+        "Each call runs independently: the working directory resets to /root and "
         "environment variables set in one call do not carry over to the next. The "
         "filesystem, installed packages, and backgrounded processes do persist, since the "
         "container is durable. To use state within a single command, chain it - e.g. "
-        "'cd src && make' - or use absolute paths (e.g. /workspace/venv/bin/python)."
+        "'cd src && make' - or use absolute paths (e.g. /root/venv/bin/python)."
     )
 
     TOOLS = [
@@ -71,7 +76,7 @@ class Sandbox:
             "description": (
                 "Run a command in your container. Returns the exit code and the command's "
                 "output, with stdout and stderr interleaved as they would appear in a "
-                "terminal. Your workspace is at /workspace.\n\n"
+                "terminal. You run as root; your home directory /root is your workspace.\n\n"
                 + _EXEC_NOTE
                 + "\n\nIf the command is still running when the timeout expires, you get the "
                 "output so far instead of an error - the command keeps running. Use "
@@ -126,30 +131,21 @@ class Sandbox:
 
     def __init__(
         self,
-        workspace: str | Path,
         image: str = DEFAULT_IMAGE,
         memory: str = "2g",
         cpus: str = "2",
         pids_limit: int = 512,
         exec_timeout: int = 60,
-        run_as_host_user: bool = True,
     ):
-        self.workspace = Path(workspace).resolve()
         self.image = image
         self.memory = memory
         self.cpus = cpus
         self.pids_limit = pids_limit
         self.exec_timeout = exec_timeout
-        self.run_as_host_user = run_as_host_user
         self.container_id: str | None = None
         self.runner: CommandRunner | None = None
 
     def start(self) -> None:
-        if not self.workspace.is_dir():
-            raise SandboxError(f"{self.workspace} is not a directory")
-        if any(self.workspace.iterdir()):
-            raise SandboxError(f"{self.workspace} is not empty - workspace must start clean")
-
         cmd = [
             "docker", "run", "-d", "--rm",
             "--runtime", "runsc",
@@ -161,21 +157,19 @@ class Sandbox:
             "--memory", self.memory,
             "--cpus", self.cpus,
             "--pids-limit", str(self.pids_limit),
-            "-v", f"{self.workspace}:{WORKSPACE_GUEST}",
-            "-w", WORKSPACE_GUEST,
+            # No host mount and no --user: the agent runs as root, and gVisor -
+            # whose sentry is itself deprivileged on the host - is the boundary.
+            # With nothing bind-mounted, container-root produces no host-side
+            # file-ownership effects.
+            "-w", WORKSPACE,
+            self.image, "sleep", "infinity",
         ]
-        if self.run_as_host_user:
-            # Files the agent creates end up owned by the host user rather than
-            # root, so the workspace can be archived/deleted without sudo. Cost:
-            # no apt-get inside the container (irrelevant under network=none).
-            cmd += ["--user", f"{os.getuid()}:{os.getgid()}"]
-        cmd += [self.image, "sleep", "infinity"]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise SandboxError(f"failed to start container: {result.stderr.strip()}")
         self.container_id = result.stdout.strip()
-        self.runner = CommandRunner(self.container_id, WORKSPACE_GUEST, self.exec_timeout)
+        self.runner = CommandRunner(self.container_id, WORKSPACE, self.exec_timeout)
 
     def stop(self) -> None:
         if self.runner is not None:
@@ -229,7 +223,7 @@ class CommandRunner:
     it can be waited on or killed. Holds no shell state - each command is an
     independent `docker exec`."""
 
-    def __init__(self, container_id: str, cwd: str = WORKSPACE_GUEST, default_timeout: int = 60):
+    def __init__(self, container_id: str, cwd: str = WORKSPACE, default_timeout: int = 60):
         self.container_id = container_id
         self.cwd = cwd
         self.default_timeout = default_timeout

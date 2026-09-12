@@ -3,18 +3,21 @@
 A sandbox that gives an LLM agent shell access to an isolated environment: one
 [gVisor](https://gvisor.dev/)-isolated Docker container per session, driven from the host
 by running each command as its own `docker exec`. The threat model is a capable, possibly
-hostile agent, so the container has three hard edges: the agent never holds real root, the
-harness and any API key stay on the host rather than inside the container, and the
-container runs with `--network none`, so it has no egress to exfiltrate data, reach a
-command-and-control host, or attack third parties. Dependencies a task needs are baked
-into the image, not fetched at run time.
+hostile agent, and the boundary is gVisor plus no network: the agent runs as root *inside*
+the container, but gVisor's sentry is itself deprivileged on the host, so container-root is
+not host-root; the harness and any API key stay on the host, never inside the container;
+and the container runs with `--network none`, so it has no egress to exfiltrate data, reach
+a command-and-control host, or attack third parties. Nothing from the host is mounted in —
+the agent's home directory `/root` is its workspace, and results are extracted from the
+container separately. Dependencies a task needs are baked into the image, not fetched at
+run time.
 
 ```python
 from gvisor_agent_sandbox import Sandbox
 
-with Sandbox("/path/to/empty/workspace") as sbx:
-    sbx.shell_exec("cd /workspace && python3 -m venv venv")   # chain state within a command
-    sbx.shell_exec("/workspace/venv/bin/python --version")    # use absolute paths across them
+with Sandbox() as sbx:
+    sbx.shell_exec("python3 -m venv venv")            # runs in /root, the workspace
+    sbx.shell_exec("/root/venv/bin/python --version") # use absolute paths across calls
 ```
 
 ## Why stateless commands instead of a persistent shell
@@ -87,10 +90,10 @@ uv run pytest -m "not docker"    # pure logic only (~0.1s; runs anywhere)
 ```
 
 The suite is split so that half of it has no infrastructure requirements. `tests/`
-covers output truncation, result rendering and the startup preconditions without a
-container at all. The rest is marked `docker` and skipped with a printed reason when the
-runtime isn't available, so `uv run pytest` is safe on a machine that can't run
-containers.
+covers output truncation, result rendering, and the tool surface (dispatch and the
+not-running guards) without a container at all. The rest is marked `docker` and skipped
+with a printed reason when the runtime isn't available, so `uv run pytest` is safe on a
+machine that can't run containers.
 
 The container tests share one session-scoped sandbox — since commands carry no state
 between calls, the only per-test cleanup needed is killing a command a test left running —

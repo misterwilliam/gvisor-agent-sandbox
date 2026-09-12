@@ -49,15 +49,15 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(scope="session")
-def sbx(tmp_path_factory):
+def sbx():
     """One container for the whole run.
 
     A fresh container per test would be cleaner but takes seconds each. Commands
     carry no session state between calls, so the only thing that can leak across
-    tests is a command left running; `_free_runner` clears that.
+    tests is a command left running; `_free_runner` clears that. (The workspace
+    filesystem is shared, so tests use distinct paths under /root.)
     """
-    workspace = tmp_path_factory.mktemp("workspace")
-    with Sandbox(workspace) as sandbox:
+    with Sandbox() as sandbox:
         yield sandbox
 
 
