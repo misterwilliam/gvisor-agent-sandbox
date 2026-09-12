@@ -224,6 +224,90 @@ class SandboxError(Exception):
     """Raised when the container fails to start."""
 
 
+class CommandRunner:
+    """Runs one command at a time in the container, tracking the running one so
+    it can be waited on or killed. Holds no shell state - each command is an
+    independent `docker exec`."""
+
+    def __init__(self, container_id: str, cwd: str = WORKSPACE_GUEST, default_timeout: int = 60):
+        self.container_id = container_id
+        self.cwd = cwd
+        self.default_timeout = default_timeout
+        self._running: _RunningCommand | None = None
+
+    def run(self, command: str, timeout: int | None = None) -> ShellResult:
+        timeout = timeout if timeout is not None else self.default_timeout
+        if self._running is not None:
+            return ShellResult(
+                status="rejected",
+                note=(
+                    f"a command has been running for {self._running.elapsed:.0f}s. "
+                    "Use shell_wait to keep waiting or shell_kill to stop it before "
+                    "running something else."
+                ),
+            )
+        self._running = _RunningCommand.start(self.container_id, self.cwd, command)
+        return self._settle(timeout)
+
+    def wait(self, timeout: int | None = None) -> ShellResult:
+        timeout = timeout if timeout is not None else self.default_timeout
+        if self._running is None:
+            return ShellResult(status="rejected", note="no command is currently running")
+        return self._settle(timeout)
+
+    def kill(self) -> ShellResult:
+        if self._running is None:
+            return ShellResult(status="rejected", note="no command is currently running")
+
+        rc = self._running
+        elapsed = rc.elapsed
+        # TERM first, then KILL. Grandchildren (make -> gcc) can survive as
+        # orphans, which is tolerable because the container is the real boundary
+        # and is disposable.
+        for sig, grace in (("TERM", 5), ("KILL", 5)):
+            rc.signal(sig)
+            code = rc.wait_exit(grace)
+            if code is not None:
+                output = rc.drain()
+                self._finish()
+                return ShellResult(
+                    output, exit_code=code, status="killed", note=f"SIG{sig} after {elapsed:.0f}s"
+                )
+
+        # The in-container process is unkillable via signals (should not happen
+        # under gVisor); drop the exec client and move on.
+        output = rc.drain()
+        rc.close()
+        self._running = None
+        return ShellResult(
+            output, status="killed", note=f"could not confirm exit after {elapsed:.0f}s"
+        )
+
+    def close(self) -> None:
+        """Kill any in-flight command; called on sandbox teardown."""
+        if self._running is not None:
+            self._running.signal("KILL")
+            self._running.close()
+            self._running = None
+
+    # ---- internals -------------------------------------------------------
+
+    def _settle(self, timeout: int) -> ShellResult:
+        rc = self._running
+        assert rc is not None
+        code = rc.wait_exit(timeout)
+        if code is not None:
+            output = rc.drain()
+            self._finish()
+            return ShellResult(output, exit_code=code, status="completed")
+        return ShellResult(rc.drain(), status="running", elapsed=rc.elapsed, idle=rc.idle)
+
+    def _finish(self) -> None:
+        if self._running is not None:
+            self._running.close()
+            self._running = None
+
+
 def _truncate(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
     """Keep the head and tail of oversized output; errors usually live at the
     end, context usually at the start."""
@@ -468,88 +552,4 @@ class _RunningCommand:
             except OSError:
                 pass
         self._thread.join(timeout=2)
-
-
-class CommandRunner:
-    """Runs one command at a time in the container, tracking the running one so
-    it can be waited on or killed. Holds no shell state - each command is an
-    independent `docker exec`."""
-
-    def __init__(self, container_id: str, cwd: str = WORKSPACE_GUEST, default_timeout: int = 60):
-        self.container_id = container_id
-        self.cwd = cwd
-        self.default_timeout = default_timeout
-        self._running: _RunningCommand | None = None
-
-    def run(self, command: str, timeout: int | None = None) -> ShellResult:
-        timeout = timeout if timeout is not None else self.default_timeout
-        if self._running is not None:
-            return ShellResult(
-                status="rejected",
-                note=(
-                    f"a command has been running for {self._running.elapsed:.0f}s. "
-                    "Use shell_wait to keep waiting or shell_kill to stop it before "
-                    "running something else."
-                ),
-            )
-        self._running = _RunningCommand.start(self.container_id, self.cwd, command)
-        return self._settle(timeout)
-
-    def wait(self, timeout: int | None = None) -> ShellResult:
-        timeout = timeout if timeout is not None else self.default_timeout
-        if self._running is None:
-            return ShellResult(status="rejected", note="no command is currently running")
-        return self._settle(timeout)
-
-    def kill(self) -> ShellResult:
-        if self._running is None:
-            return ShellResult(status="rejected", note="no command is currently running")
-
-        rc = self._running
-        elapsed = rc.elapsed
-        # TERM first, then KILL. Grandchildren (make -> gcc) can survive as
-        # orphans, which is tolerable because the container is the real boundary
-        # and is disposable.
-        for sig, grace in (("TERM", 5), ("KILL", 5)):
-            rc.signal(sig)
-            code = rc.wait_exit(grace)
-            if code is not None:
-                output = rc.drain()
-                self._finish()
-                return ShellResult(
-                    output, exit_code=code, status="killed", note=f"SIG{sig} after {elapsed:.0f}s"
-                )
-
-        # The in-container process is unkillable via signals (should not happen
-        # under gVisor); drop the exec client and move on.
-        output = rc.drain()
-        rc.close()
-        self._running = None
-        return ShellResult(
-            output, status="killed", note=f"could not confirm exit after {elapsed:.0f}s"
-        )
-
-    def close(self) -> None:
-        """Kill any in-flight command; called on sandbox teardown."""
-        if self._running is not None:
-            self._running.signal("KILL")
-            self._running.close()
-            self._running = None
-
-    # ---- internals -------------------------------------------------------
-
-    def _settle(self, timeout: int) -> ShellResult:
-        rc = self._running
-        assert rc is not None
-        code = rc.wait_exit(timeout)
-        if code is not None:
-            output = rc.drain()
-            self._finish()
-            return ShellResult(output, exit_code=code, status="completed")
-        return ShellResult(rc.drain(), status="running", elapsed=rc.elapsed, idle=rc.idle)
-
-    def _finish(self) -> None:
-        if self._running is not None:
-            self._running.close()
-            self._running = None
 
