@@ -52,8 +52,7 @@ class Sandbox:
 
     The agent runs as root with /root as its home and workspace. Nothing from
     the host is mounted in; the container's own filesystem holds the work, and
-    results are extracted from it separately. Commands run one at a time via
-    CommandRunner.
+    results are extracted from it separately.
     """
 
     _EXEC_NOTE = (
@@ -141,7 +140,7 @@ class Sandbox:
         self.pids_limit = pids_limit
         self.exec_timeout = exec_timeout
         self.container_id: str | None = None
-        self.runner: CommandRunner | None = None
+        self.runner: Command | None = None
 
     def start(self) -> None:
         # Start container and sleep forever.
@@ -169,9 +168,7 @@ class Sandbox:
         if result.returncode != 0:
             raise SandboxError(f"failed to start container: {result.stderr.strip()}")
         self.container_id = result.stdout.strip()
-        self.runner = CommandRunner(
-            self.container_id, Sandbox.ROOT_USER_HOME_DIR, self.exec_timeout
-        )
+        self.runner = Command(self.container_id, Sandbox.ROOT_USER_HOME_DIR, self.exec_timeout)
 
     def stop(self) -> None:
         if self.runner is not None:
@@ -225,10 +222,11 @@ class SandboxError(Exception):
     """Raised when the container fails to start."""
 
 
-class CommandRunner:
-    """Runs one command at a time in the container, tracking the running one so
-    it can be waited on or killed. Holds no shell state - each command is an
-    independent `docker exec`."""
+class Command:
+    """Represents one command.
+
+    Supports waiting on command to return till timeout, and killing the command.
+    """
 
     def __init__(
         self, container_id: str, cwd: str = Sandbox.ROOT_USER_HOME_DIR, default_timeout: int = 60
