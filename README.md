@@ -99,10 +99,13 @@ The container tests share one session-scoped sandbox — since commands carry no
 between calls, the only per-test cleanup needed is killing a command a test left running —
 which keeps the whole suite under twenty seconds.
 
-## Formatting
+## Linting
 
 ```bash
+# Format
 uv run ruff format .
+# Lint checks
+uv run ruff check --fix
 ```
 
 ## Status

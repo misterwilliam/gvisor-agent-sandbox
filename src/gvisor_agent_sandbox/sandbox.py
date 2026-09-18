@@ -35,6 +35,7 @@ import os
 import subprocess
 import threading
 import time
+import typing
 
 # Full python image (not -slim) is based on buildpack-deps, so it ships gcc,
 # make, and friends - enough for "write a C compiler"-shaped tasks without a
@@ -63,7 +64,7 @@ class Sandbox:
         "'cd src && make' - or use absolute paths (e.g. /root/venv/bin/python)."
     )
 
-    TOOLS = [
+    TOOLS: typing.ClassVar = [
         {
             "name": "shell_exec",
             "description": (
@@ -164,7 +165,7 @@ class Sandbox:
         ] + start_cmd
         # fmt: on
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, check=False, text=True)
         if result.returncode != 0:
             raise SandboxError(f"failed to start container: {result.stderr.strip()}")
         self.container_id = result.stdout.strip()
@@ -178,11 +179,14 @@ class Sandbox:
             self.runner = None
         if self.container_id is not None:
             subprocess.run(
-                ["docker", "rm", "-f", self.container_id], capture_output=True, text=True
+                ["docker", "rm", "-f", self.container_id],
+                capture_output=True,
+                check=False,
+                text=True,
             )
             self.container_id = None
 
-    def __enter__(self) -> Sandbox:
+    def __enter__(self) -> typing.Self:
         self.start()
         return self
 
@@ -546,6 +550,7 @@ class _RunningCommand:
                     f"pkill -{sig} -P {pid} 2>/dev/null; kill -{sig} {pid} 2>/dev/null; true",
                 ],
                 capture_output=True,
+                check=False,
             )
         else:
             try:

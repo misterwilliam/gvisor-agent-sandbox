@@ -26,6 +26,7 @@ def _why_docker_unavailable() -> str | None:
         result = subprocess.run(
             ["docker", "info", "--format", "{{json .Runtimes}}"],
             capture_output=True,
+            check=False,
             text=True,
             timeout=30,
         )
