@@ -16,8 +16,8 @@ run time.
 from gvisor_agent_sandbox import Sandbox
 
 with Sandbox() as sbx:
-    sbx.shell_exec("python3 -m venv venv")            # runs in /root, the workspace
-    sbx.shell_exec("/root/venv/bin/python --version") # use absolute paths across calls
+    sbx.shell_exec("python3 -m venv venv")  # runs in /root, the workspace
+    sbx.shell_exec("/root/venv/bin/python --version")  # use absolute paths across calls
 ```
 
 ## Why stateless commands instead of a persistent shell
@@ -98,6 +98,12 @@ machine that can't run containers.
 The container tests share one session-scoped sandbox — since commands carry no state
 between calls, the only per-test cleanup needed is killing a command a test left running —
 which keeps the whole suite under twenty seconds.
+
+## Formatting
+
+```bash
+uv run ruff format .
+```
 
 ## Status
 

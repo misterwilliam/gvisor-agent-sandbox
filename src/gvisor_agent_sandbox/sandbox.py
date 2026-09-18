@@ -41,16 +41,9 @@ import time
 # custom image.
 DEFAULT_IMAGE = "python:3.12"
 
-# The agent's home and working directory; each command starts here. The agent
-# runs as root, so /root already exists and is writable and doubles as the
-# workspace. Nothing from the host is mounted here - the work stays in the
-# container until it is extracted separately.
-WORKSPACE = "/root"
-
 # Cap on how much output is handed back in a single result. Build and test
 # logs would otherwise dominate the context window over a long run.
 MAX_OUTPUT_BYTES = 30_000
-
 
 
 class Sandbox:
@@ -76,7 +69,8 @@ class Sandbox:
             "description": (
                 "Run a command in your container. Returns the exit code and the command's "
                 "output, with stdout and stderr interleaved as they would appear in a "
-                "terminal. You run as root; your home directory /root is your workspace.\n\n"
+                "terminal. You run as root; your commands will be executed from your "
+                "home directory which is /root.\n\n"
                 + _EXEC_NOTE
                 + "\n\nIf the command is still running when the timeout expires, you get the "
                 "output so far instead of an error - the command keeps running. Use "
@@ -129,6 +123,9 @@ class Sandbox:
         },
     ]
 
+    # Home directory of root user. This is the directory we will run all commands from.
+    ROOT_USER_HOME_DIR = "/root"
+
     def __init__(
         self,
         image: str = DEFAULT_IMAGE,
@@ -146,40 +143,46 @@ class Sandbox:
         self.runner: CommandRunner | None = None
 
     def start(self) -> None:
+        # Start container and sleep forever.
+        start_cmd = ["sleep", "infinity"]
+        # fmt: off
         cmd = [
-            "docker", "run", "-d", "--rm",
+            "docker", "run",
+            # Run container in background and print container ID
+            "--detach",
+            "--rm",
             "--runtime", "runsc",
-            # Not configurable. The threat model is a capable, possibly hostile
-            # agent; egress would let it exfiltrate data, reach a C2 host, or
-            # attack third parties from this machine - risks the syscall and
-            # filesystem boundaries do nothing about. `none` is the whole point.
+            # Block network access.
             "--network", "none",
             "--memory", self.memory,
             "--cpus", self.cpus,
             "--pids-limit", str(self.pids_limit),
-            # No host mount and no --user: the agent runs as root, and gVisor -
-            # whose sentry is itself deprivileged on the host - is the boundary.
-            # With nothing bind-mounted, container-root produces no host-side
-            # file-ownership effects.
-            "-w", WORKSPACE,
-            self.image, "sleep", "infinity",
-        ]
+            # Run commands from /root. Automatically created by docker if it does not exist, but
+            # that is unlikely since images in general do have a /root directory.
+            "--workdir", Sandbox.ROOT_USER_HOME_DIR,
+            self.image,
+        ] + start_cmd
+        # fmt: on
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise SandboxError(f"failed to start container: {result.stderr.strip()}")
         self.container_id = result.stdout.strip()
-        self.runner = CommandRunner(self.container_id, WORKSPACE, self.exec_timeout)
+        self.runner = CommandRunner(
+            self.container_id, Sandbox.ROOT_USER_HOME_DIR, self.exec_timeout
+        )
 
     def stop(self) -> None:
         if self.runner is not None:
             self.runner.close()
             self.runner = None
         if self.container_id is not None:
-            subprocess.run(["docker", "rm", "-f", self.container_id], capture_output=True, text=True)
+            subprocess.run(
+                ["docker", "rm", "-f", self.container_id], capture_output=True, text=True
+            )
             self.container_id = None
 
-    def __enter__(self) -> "Sandbox":
+    def __enter__(self) -> Sandbox:
         self.start()
         return self
 
@@ -223,7 +226,9 @@ class CommandRunner:
     it can be waited on or killed. Holds no shell state - each command is an
     independent `docker exec`."""
 
-    def __init__(self, container_id: str, cwd: str = WORKSPACE, default_timeout: int = 60):
+    def __init__(
+        self, container_id: str, cwd: str = Sandbox.ROOT_USER_HOME_DIR, default_timeout: int = 60
+    ):
         self.container_id = container_id
         self.cwd = cwd
         self.default_timeout = default_timeout
@@ -417,11 +422,19 @@ class _RunningCommand:
         self._thread.start()
 
     @classmethod
-    def start(cls, container_id: str, cwd: str, command: str) -> "_RunningCommand":
+    def start(cls, container_id: str, cwd: str, command: str) -> _RunningCommand:
         proc = subprocess.Popen(
             [
-                "docker", "exec", "-w", cwd, container_id,
-                "bash", "-c", 'echo "__PID__$$"; exec bash -c "$1" 2>&1', "bash", command,
+                "docker",
+                "exec",
+                "-w",
+                cwd,
+                container_id,
+                "bash",
+                "-c",
+                'echo "__PID__$$"; exec bash -c "$1" 2>&1',
+                "bash",
+                command,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -525,7 +538,11 @@ class _RunningCommand:
         if pid and pid > 0:
             subprocess.run(
                 [
-                    "docker", "exec", self.container_id, "bash", "-c",
+                    "docker",
+                    "exec",
+                    self.container_id,
+                    "bash",
+                    "-c",
                     f"pkill -{sig} -P {pid} 2>/dev/null; kill -{sig} {pid} 2>/dev/null; true",
                 ],
                 capture_output=True,
@@ -546,4 +563,3 @@ class _RunningCommand:
             except OSError:
                 pass
         self._thread.join(timeout=2)
-

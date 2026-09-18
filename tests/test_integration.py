@@ -9,6 +9,7 @@ test_units.py.
 All of these share one container (see the `sbx` fixture). Skipped
 automatically where Docker or gVisor is missing.
 """
+
 import pytest
 
 pytestmark = pytest.mark.docker
@@ -188,9 +189,7 @@ def test_heredoc_writes_exact_content(sbx):
     # quoted heredoc carry content that expansion would otherwise mangle. With
     # no host mount, the file is read back through the container, not the host.
     content = '#!/bin/sh\nname="$USER and `whoami`"\necho \'single\' "double" \\back\n'
-    write = sbx.runner.run(
-        f"mkdir -p /root/gen && cat > /root/gen/f.sh <<'XEOF'\n{content}XEOF\n"
-    )
+    write = sbx.runner.run(f"mkdir -p /root/gen && cat > /root/gen/f.sh <<'XEOF'\n{content}XEOF\n")
     assert write.exit_code == 0
     assert sbx.runner.run("cat /root/gen/f.sh").output == content
 
