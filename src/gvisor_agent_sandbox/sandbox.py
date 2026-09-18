@@ -260,16 +260,15 @@ class Command:
         if self._running is None:
             return ShellResult(status="rejected", note="no command is currently running")
 
-        rc = self._running
-        elapsed = rc.elapsed
+        elapsed = self._running.elapsed
         # TERM first, then KILL. Grandchildren (make -> gcc) can survive as
         # orphans, which is tolerable because the container is the real boundary
         # and is disposable.
         for sig, grace in (("TERM", 5), ("KILL", 5)):
-            rc.signal(sig)
-            code = rc.wait_exit(grace)
+            self._running.signal(sig)
+            code = self._running.wait_exit(grace)
             if code is not None:
-                output = rc.drain()
+                output = self._running.drain()
                 self._finish()
                 return ShellResult(
                     output, exit_code=code, status="killed", note=f"SIG{sig} after {elapsed:.0f}s"
@@ -277,8 +276,8 @@ class Command:
 
         # The in-container process is unkillable via signals (should not happen
         # under gVisor); drop the exec client and move on.
-        output = rc.drain()
-        rc.close()
+        output = self._running.drain()
+        self._running.close()
         self._running = None
         return ShellResult(
             output, status="killed", note=f"could not confirm exit after {elapsed:.0f}s"
@@ -294,14 +293,18 @@ class Command:
     # ---- internals -------------------------------------------------------
 
     def _settle(self, timeout: int) -> ShellResult:
-        rc = self._running
-        assert rc is not None
-        code = rc.wait_exit(timeout)
+        assert self._running is not None
+        code = self._running.wait_exit(timeout)
         if code is not None:
-            output = rc.drain()
+            output = self._running.drain()
             self._finish()
             return ShellResult(output, exit_code=code, status="completed")
-        return ShellResult(rc.drain(), status="running", elapsed=rc.elapsed, idle=rc.idle)
+        return ShellResult(
+            self._running.drain(),
+            status="running",
+            elapsed=self._running.elapsed,
+            idle=self._running.idle,
+        )
 
     def _finish(self) -> None:
         if self._running is not None:
@@ -389,7 +392,7 @@ class _RunningCommand:
 
     The command is launched as:
 
-        docker exec -w <cwd> <cid> bash -c 'echo "__PID__$$"; exec bash -c "$1" 2>&1' bash <command>
+        docker exec --workdir <cwd> <cid> bash -c 'echo "__PID__$$"; exec bash -c "$1" 2>&1' bash <command>
 
     Three things earn that wrapper:
 
@@ -425,18 +428,17 @@ class _RunningCommand:
 
     @classmethod
     def start(cls, container_id: str, cwd: str, command: str) -> _RunningCommand:
+        # fmt: off
         proc = subprocess.Popen(
             [
                 "docker",
                 "exec",
-                "-w",
-                cwd,
+                "--workdir", cwd,
                 container_id,
                 "bash",
                 "-c",
                 'echo "__PID__$$"; exec bash -c "$1" 2>&1',
-                "bash",
-                command,
+                "bash", command,
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -445,6 +447,7 @@ class _RunningCommand:
             # client-side diagnostics.
             stderr=subprocess.STDOUT,
         )
+        # fmt: on
         return cls(container_id, proc)
 
     # ---- output ----------------------------------------------------------
