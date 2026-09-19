@@ -428,6 +428,34 @@ class _RunningCommand:
 
     @classmethod
     def start(cls, container_id: str, cwd: str, command: str) -> _RunningCommand:
+        # container_cmd is what docker exec runs inside the container.
+        # bash -c accepts the following format:
+        # bash -c <script> $0 $1
+        # The script in our case is 'echo "__PID__$$"; exec bash -c "$1" 2>&1'
+        # $0 is set to "bash"
+        # $1 is set to <command>
+        # The script is what is executed. Within the script $0 (ie the shell name) is set to bash,
+        # and $1 is set to <command>. The script first echos the PID of the bash process
+        # prefixed by __PID__ then exec replaces the current bash process image with a new bash
+        # process so that the PID stays constant. Then script executes $1 (ie <command>). The
+        # stdout and stderr of <command> are interleaved into stdout.
+        # fmt: off
+        container_cmd = [
+            "bash", "-c",
+            'echo "__PID__$$"; exec bash -c "$1" 2>&1', # script
+            "bash",  # $0
+            command, # $1
+        ]
+        # fmt: on
+        # Run <container_cmd> inside <container_id>. Stdout of the subprocess will be stdout of
+        # docker exec. Key security assumption: we are going to assume that this is purely the
+        # stdout of container_cmd and does not contain anything from running docker exec. Docker
+        # exec stderr can contain the error message of running docker exec (not the container_cmd)
+        # so we are going to discard that. Therefore stdout will be:
+        # __PID__<bash PID><interleaved stdout and stderr><stream close>
+        # If we don't see __PID__ as the prefix to stdout, we will know that docker exec is not
+        # purely stdout of container_cmd.
+        # TODO: Throw Security exception if we don't see __PID__ as prefix.
         # fmt: off
         proc = subprocess.Popen(
             [
@@ -435,19 +463,16 @@ class _RunningCommand:
                 "exec",
                 "--workdir", cwd,
                 container_id,
-                "bash",
-                "-c",
-                'echo "__PID__$$"; exec bash -c "$1" 2>&1',
-                "bash", command,
-            ],
+            ] + container_cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            # The command's stderr is already merged into stdout inside the
-            # container (2>&1 above); this only folds in docker exec's own
-            # client-side diagnostics.
-            stderr=subprocess.STDOUT,
+            # TODO: Ignore docker exec's err messages for now. When we add logging to the sandbox
+            # redirect this to the sandbox logs. Safe to discard because container_cmd merged stderr
+            # into stdout.
+            stderr=subprocess.DEVNULL,
         )
         # fmt: on
+
         return cls(container_id, proc)
 
     # ---- output ----------------------------------------------------------
