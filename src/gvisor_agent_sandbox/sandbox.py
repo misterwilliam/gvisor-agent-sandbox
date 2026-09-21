@@ -31,11 +31,11 @@ user must be in the `docker` group (no sudo needed - if you just added
 yourself, start a new shell for it to take effect).
 """
 
-import os
 import subprocess
-import threading
 import time
 import typing
+
+from .stream import FdDrainer
 
 # Full python image (not -slim) is based on buildpack-deps, so it ships gcc,
 # make, and friends - enough for "write a C compiler"-shaped tasks without a
@@ -388,7 +388,7 @@ class ShellResult:
 
 
 class _RunningCommand:
-    """One `docker exec` in flight, with a thread draining its output.
+    """One `docker exec` in flight, with a `FdDrainer` reading its output.
 
     The command is launched as:
 
@@ -402,7 +402,7 @@ class _RunningCommand:
     - `echo "__PID__$$"` then `exec` prints the pid of the bash that (after the
       exec, which preserves the pid) runs the command. That pid is what
       `shell_kill` signals; it travels as the guaranteed-first output line,
-      which the reader strips before any command output can appear, so nothing
+      which `drain` strips before any command output can appear, so nothing
       the command prints can be mistaken for it.
     - `2>&1` merges stderr into stdout *inside the container*. `docker exec`
       transports stdout and stderr as separate streams whose relative ordering
@@ -415,16 +415,14 @@ class _RunningCommand:
     """
 
     def __init__(self, container_id: str, proc: subprocess.Popen):
+        assert proc.stdout is not None
         self.container_id = container_id
         self.proc = proc
         self.pid: int | None = None  # in-container pid of the command's bash
-        self._buffer = bytearray()
-        self._lock = threading.Lock()
         self.started_at = time.monotonic()
-        self.last_output_at = time.monotonic()
-        self.shown = 0  # characters already returned to the agent
-        self._thread = threading.Thread(target=self._reader, daemon=True)
-        self._thread.start()
+        self.shown = 0  # characters of real output already returned to the agent
+        self._output_start: int | None = None  # byte offset just past the __PID__ line
+        self._drainer = FdDrainer(proc.stdout)
 
     @classmethod
     def start(cls, container_id: str, cwd: str, command: str) -> _RunningCommand:
@@ -477,62 +475,49 @@ class _RunningCommand:
 
     # ---- output ----------------------------------------------------------
 
-    def _reader(self) -> None:
-        assert self.proc.stdout is not None
-        fd = self.proc.stdout.fileno()
-        header = b""
-        pid_done = False
-        try:
-            while True:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                if not pid_done:
-                    header += chunk
-                    nl = header.find(b"\n")
-                    if nl == -1:
-                        continue
-                    line, rest = header[:nl], header[nl + 1 :]
-                    if line.startswith(b"__PID__"):
-                        try:
-                            self.pid = int(line[len(b"__PID__") :].strip())
-                        except ValueError:
-                            self.pid = -1
-                    else:
-                        # No pid line (e.g. docker exec itself errored); treat
-                        # everything as output so the error still surfaces.
-                        self.pid = -1
-                        rest = header
-                    pid_done = True
-                    if rest:
-                        self._append(rest)
-                else:
-                    self._append(chunk)
-        except OSError:
-            pass
-        finally:
-            try:
-                self.proc.stdout.close()
-            except OSError:
-                pass
-
-    def _append(self, data: bytes) -> None:
-        with self._lock:
-            self._buffer += data
-            self.last_output_at = time.monotonic()
-
     def drain(self) -> str:
         """Return output not yet shown to the agent, advancing the cursor.
 
-        Decodes the whole buffer and slices by character so a multi-byte
-        sequence is never split at the cursor boundary.
+        Reads the whole stream so far, drops the __PID__ header line, decodes,
+        and slices by character so a multi-byte sequence is never split at the
+        cursor boundary.
         """
-        with self._lock:
-            data = bytes(self._buffer).decode(errors="replace")
+        raw = self._drainer.snapshot()
+        start = self._locate_output(raw)
+        if start is None:
+            return ""  # the __PID__ line hasn't fully arrived yet
+        data = raw[start:].decode(errors="replace")
         new = data[self.shown :]
         if new:
             self.shown = len(data)
         return new
+
+    def _locate_output(self, raw: bytes) -> int | None:
+        r"""Parse the __PID__ header once; return the byte offset where real
+        output begins, or None if that header line hasn't fully arrived.
+
+        The wrapper prints `__PID__<pid>\n` before the command runs, so it is
+        always the first line. Its absence means docker exec never got the
+        container command running (see the note in `start`).
+        """
+        if self._output_start is not None:
+            return self._output_start
+        nl = raw.find(b"\n")
+        if nl == -1:
+            return None
+        line = raw[:nl]
+        if line.startswith(b"__PID__"):
+            try:
+                self.pid = int(line[len(b"__PID__") :].strip())
+            except ValueError:
+                self.pid = -1
+            self._output_start = nl + 1
+        else:
+            # No pid line (e.g. docker exec itself errored); treat everything as
+            # output so the error still surfaces.
+            self.pid = -1
+            self._output_start = 0
+        return self._output_start
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -542,7 +527,7 @@ class _RunningCommand:
 
     @property
     def idle(self) -> float:
-        return time.monotonic() - self.last_output_at
+        return self._drainer.idle
 
     def wait_exit(self, timeout: float) -> int | None:
         """Return the command's exit code if it finishes within `timeout`, else
@@ -551,12 +536,15 @@ class _RunningCommand:
             self.proc.wait(timeout)
         except subprocess.TimeoutExpired:
             return None
-        self._thread.join(timeout=2)  # let the reader capture the last bytes
+        self._drainer.join(timeout_sec=2)  # let the drainer capture the last bytes
         return self.proc.returncode
 
     def _await_pid(self, timeout: float) -> int | None:
         deadline = time.monotonic() + timeout
         while self.pid is None and time.monotonic() < deadline:
+            self._locate_output(self._drainer.snapshot())
+            if self.pid is not None:
+                break
             time.sleep(0.02)
         return self.pid
 
@@ -585,7 +573,7 @@ class _RunningCommand:
                 pass
 
     def close(self) -> None:
-        """Make sure the exec client and its reader are gone."""
+        """Make sure the exec client and its drainer are gone."""
         try:
             self.proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -593,4 +581,4 @@ class _RunningCommand:
                 self.proc.kill()
             except OSError:
                 pass
-        self._thread.join(timeout=2)
+        self._drainer.close()
