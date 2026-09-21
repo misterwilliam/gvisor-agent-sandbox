@@ -31,11 +31,12 @@ user must be in the `docker` group (no sudo needed - if you just added
 yourself, start a new shell for it to take effect).
 """
 
+import codecs
 import subprocess
 import time
 import typing
 
-from .stream import FdDrainer
+from .stream import AssertAndDiscardStreamPrefix, FdDrainer, StreamPrefixError
 
 # Full python image (not -slim) is based on buildpack-deps, so it ships gcc,
 # make, and friends - enough for "write a C compiler"-shaped tasks without a
@@ -420,9 +421,18 @@ class _RunningCommand:
         self.proc = proc
         self.pid: int | None = None  # in-container pid of the command's bash
         self.started_at = time.monotonic()
-        self.shown = 0  # characters of real output already returned to the agent
-        self._output_start: int | None = None  # byte offset just past the __PID__ line
         self._drainer = FdDrainer(proc.stdout)
+        # Output interpretation, fed block-by-block from the drainer: assert and
+        # strip the __PID__ sentinel, read the pid, then decode the rest
+        # incrementally so a UTF-8 sequence split across two reads is never
+        # mangled at the boundary.
+        self._prefix = AssertAndDiscardStreamPrefix(b"__PID__")
+        self._pid_parsed = False
+        self._pid_line = bytearray()  # the <pid>\n after the sentinel, until the newline
+        self._decoder: codecs.IncrementalDecoder | None = codecs.getincrementaldecoder("utf-8")(
+            errors="replace"
+        )
+        self._pending = ""  # decoded output produced but not yet returned by drain()
 
     @classmethod
     def start(cls, container_id: str, cwd: str, command: str) -> _RunningCommand:
@@ -451,9 +461,9 @@ class _RunningCommand:
         # exec stderr can contain the error message of running docker exec (not the container_cmd)
         # so we are going to discard that. Therefore stdout will be:
         # __PID__<bash PID><interleaved stdout and stderr><stream close>
-        # If we don't see __PID__ as the prefix to stdout, we will know that docker exec is not
-        # purely stdout of container_cmd.
-        # TODO: Throw Security exception if we don't see __PID__ as prefix.
+        # If stdout does not start with __PID__, the stream is not purely
+        # container_cmd's stdout; AssertAndDiscardStreamPrefix enforces this and
+        # raises StreamPrefixError.
         # fmt: off
         proc = subprocess.Popen(
             [
@@ -476,48 +486,62 @@ class _RunningCommand:
     # ---- output ----------------------------------------------------------
 
     def drain(self) -> str:
-        """Return output not yet shown to the agent, advancing the cursor.
+        """Return output produced since the last call.
 
-        Reads the whole stream so far, drops the __PID__ header line, decodes,
-        and slices by character so a multi-byte sequence is never split at the
-        cursor boundary.
+        Pulls the next block of bytes from the drainer, strips the __PID__
+        header line once, and decodes the rest incrementally.
         """
-        raw = self._drainer.snapshot()
-        start = self._locate_output(raw)
-        if start is None:
-            return ""  # the __PID__ line hasn't fully arrived yet
-        data = raw[start:].decode(errors="replace")
-        new = data[self.shown :]
-        if new:
-            self.shown = len(data)
-        return new
+        self._ingest()
+        out = self._pending
+        self._pending = ""
+        return out
 
-    def _locate_output(self, raw: bytes) -> int | None:
-        r"""Parse the __PID__ header once; return the byte offset where real
-        output begins, or None if that header line hasn't fully arrived.
+    def _ingest(self) -> None:
+        """Pull the next block from the drainer and turn it into pending output:
+        assert and strip the __PID__ header the first time, then decode the rest.
 
-        The wrapper prints `__PID__<pid>\n` before the command runs, so it is
-        always the first line. Its absence means docker exec never got the
-        container command running (see the note in `start`).
+        Both `drain` and `_await_pid` call this - draining the drainer parses the
+        pid as a side effect - so output pulled while waiting for the pid is held
+        in `_pending` for the next `drain`, never lost.
         """
-        if self._output_start is not None:
-            return self._output_start
-        nl = raw.find(b"\n")
+        if self._decoder is None:
+            return  # a final decode already flushed the decoder at EOF
+        block = self._drainer.read()
+        final = self._drainer.finished()
+        if not block and not final:
+            return
+        output = self._strip_pid(block)  # raises StreamPrefixError if __PID__ is absent
+        if final and not self._prefix.done:
+            raise StreamPrefixError("stream ended before the __PID__ sentinel arrived")
+        self._pending += self._decoder.decode(output, final=final)
+        if final:
+            self._decoder = None  # a final decode cannot be reused
+
+    def _strip_pid(self, block: bytes) -> bytes:
+        r"""Consume the `__PID__<pid>\n` header the wrapper prints first,
+        recording the pid, and return the bytes that are real output.
+
+        `AssertAndDiscardStreamPrefix` verifies and removes the `__PID__`
+        sentinel (raising `StreamPrefixError` if the stream does not start with
+        it - see the security note in `start`); what remains is `<pid>\n` then
+        the command's output.
+        """
+        if self._pid_parsed:
+            return block
+        after_sentinel = self._prefix.feed(block)  # raises if __PID__ is absent
+        if not after_sentinel:
+            return b""  # still matching the sentinel
+        self._pid_line += after_sentinel
+        nl = self._pid_line.find(b"\n")
         if nl == -1:
-            return None
-        line = raw[:nl]
-        if line.startswith(b"__PID__"):
-            try:
-                self.pid = int(line[len(b"__PID__") :].strip())
-            except ValueError:
-                self.pid = -1
-            self._output_start = nl + 1
-        else:
-            # No pid line (e.g. docker exec itself errored); treat everything as
-            # output so the error still surfaces.
+            return b""  # pid digits not terminated yet
+        line, rest = bytes(self._pid_line[:nl]), bytes(self._pid_line[nl + 1 :])
+        try:
+            self.pid = int(line.strip())
+        except ValueError:
             self.pid = -1
-            self._output_start = 0
-        return self._output_start
+        self._pid_parsed = True
+        return rest
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -542,7 +566,7 @@ class _RunningCommand:
     def _await_pid(self, timeout: float) -> int | None:
         deadline = time.monotonic() + timeout
         while self.pid is None and time.monotonic() < deadline:
-            self._locate_output(self._drainer.snapshot())
+            self._ingest()  # parses the pid as a side effect; any output goes to _pending
             if self.pid is not None:
                 break
             time.sleep(0.02)
