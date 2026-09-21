@@ -91,8 +91,8 @@ class AssertAndDiscardStreamPrefix:
     equal `prefix`, strips them, and passes everything after through unchanged.
     A block that diverges from the prefix raises `StreamPrefixError` as soon as
     the first mismatching byte is seen, and the prefix may be split across any
-    number of feeds. At end of stream, check `done`: a stream that ended before
-    the whole prefix arrived never satisfied it.
+    number of feeds. Pass `end=True` on the final feed: a stream that ended
+    before the whole prefix arrived also raises `StreamPrefixError`.
     """
 
     def __init__(self, prefix: bytes):
@@ -100,14 +100,14 @@ class AssertAndDiscardStreamPrefix:
         self._matched = 0  # bytes of the prefix confirmed so far
         self._done = False
 
-    @property
-    def done(self) -> bool:
-        """True once the whole prefix has been seen and discarded."""
-        return self._done
-
-    def feed(self, block: bytes) -> bytes:
+    def feed(self, block: bytes, *, end: bool = False) -> bytes:
         """Consume a block; return the bytes following the prefix (empty until
-        the prefix is fully matched). Raises `StreamPrefixError` on a mismatch."""
+        the prefix is fully matched).
+
+        Raises `StreamPrefixError` as soon as a byte diverges from the prefix,
+        or - when `end` is True (the stream has no more bytes) - if the prefix
+        was not fully matched by then.
+        """
         if self._done:
             return block
         remaining = self._prefix[self._matched :]
@@ -118,4 +118,6 @@ class AssertAndDiscardStreamPrefix:
         if self._matched == len(self._prefix):
             self._done = True
             return block[n:]
+        if end:
+            raise StreamPrefixError(f"stream ended before the prefix {self._prefix!r} completed")
         return b""

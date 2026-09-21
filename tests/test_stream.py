@@ -132,22 +132,20 @@ def test_close_is_idempotent():
 def test_prefix_discarded_when_present_in_one_block():
     f = AssertAndDiscardStreamPrefix(b"__PID__")
     assert f.feed(b"__PID__123\nrest") == b"123\nrest"
-    assert f.done is True
-    assert f.feed(b"more") == b"more"  # everything after the prefix passes through
+    assert f.feed(b"more") == b"more"  # done: everything after the prefix passes through
 
 
 def test_prefix_split_across_blocks():
     f = AssertAndDiscardStreamPrefix(b"__PID__")
     assert f.feed(b"__PI") == b""  # partial prefix, nothing to emit yet
-    assert f.done is False
     assert f.feed(b"D__tail") == b"tail"
-    assert f.done is True
+    assert f.feed(b"more") == b"more"  # and it passes through afterwards
 
 
-def test_prefix_exactly_then_nothing():
+def test_prefix_exactly_then_passes_through():
     f = AssertAndDiscardStreamPrefix(b"__PID__")
     assert f.feed(b"__PID__") == b""
-    assert f.done is True
+    assert f.feed(b"x") == b"x"  # done once the whole prefix is seen
 
 
 def test_mismatch_raises():
@@ -166,5 +164,17 @@ def test_mismatch_detected_across_a_split():
 def test_empty_feeds_are_harmless():
     f = AssertAndDiscardStreamPrefix(b"__PID__")
     assert f.feed(b"") == b""
-    assert f.done is False
     assert f.feed(b"__PID__x") == b"x"
+
+
+def test_end_before_prefix_complete_raises():
+    f = AssertAndDiscardStreamPrefix(b"__PID__")
+    f.feed(b"__PI")  # partial prefix
+    with pytest.raises(StreamPrefixError):
+        f.feed(b"", end=True)  # stream ended before the prefix completed
+
+
+def test_end_once_prefix_is_complete_is_harmless():
+    f = AssertAndDiscardStreamPrefix(b"__PID__")
+    assert f.feed(b"__PID__tail", end=True) == b"tail"  # completes and ends together
+    assert f.feed(b"", end=True) == b""  # already satisfied

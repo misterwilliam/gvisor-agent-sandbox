@@ -36,7 +36,7 @@ import subprocess
 import time
 import typing
 
-from .stream import AssertAndDiscardStreamPrefix, FdDrainer, StreamPrefixError
+from .stream import AssertAndDiscardStreamPrefix, FdDrainer
 
 # Full python image (not -slim) is based on buildpack-deps, so it ships gcc,
 # make, and friends - enough for "write a C compiler"-shaped tasks without a
@@ -510,14 +510,13 @@ class _RunningCommand:
         final = self._drainer.finished()
         if not block and not final:
             return
-        output = self._strip_pid(block)  # raises StreamPrefixError if __PID__ is absent
-        if final and not self._prefix.done:
-            raise StreamPrefixError("stream ended before the __PID__ sentinel arrived")
+        # _strip_pid raises StreamPrefixError if __PID__ is absent, or (at EOF) truncated.
+        output = self._strip_pid(block, final)
         self._pending += self._decoder.decode(output, final=final)
         if final:
             self._decoder = None  # a final decode cannot be reused
 
-    def _strip_pid(self, block: bytes) -> bytes:
+    def _strip_pid(self, block: bytes, final: bool) -> bytes:
         r"""Consume the `__PID__<pid>\n` header the wrapper prints first,
         recording the pid, and return the bytes that are real output.
 
@@ -528,7 +527,7 @@ class _RunningCommand:
         """
         if self._pid_parsed:
             return block
-        after_sentinel = self._prefix.feed(block)  # raises if __PID__ is absent
+        after_sentinel = self._prefix.feed(block, end=final)  # raises if __PID__ absent/truncated
         if not after_sentinel:
             return b""  # still matching the sentinel
         self._pid_line += after_sentinel
