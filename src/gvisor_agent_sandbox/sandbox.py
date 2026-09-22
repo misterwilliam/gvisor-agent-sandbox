@@ -483,8 +483,6 @@ class _RunningCommand:
 
         return cls(container_id, proc)
 
-    # ---- output ----------------------------------------------------------
-
     def drain(self) -> str:
         """Return output produced since the last call.
 
@@ -495,6 +493,59 @@ class _RunningCommand:
         out = self._pending
         self._pending = ""
         return out
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started_at
+
+    @property
+    def idle(self) -> float:
+        return self._drainer.idle
+
+    def wait_exit(self, timeout: float) -> int | None:
+        """Return the command's exit code if it finishes within `timeout`, else
+        None. `docker exec` propagates the exec'd process's exit code."""
+        try:
+            self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            return None
+        self._drainer.join(timeout_sec=2)  # let the drainer capture the last bytes
+        return self.proc.returncode
+
+    def signal(self, sig: str) -> None:
+        """Signal the in-container command by pid: its children (pkill -P) and
+        the command's bash itself. Falls back to killing the `docker exec`
+        client if the pid never arrived."""
+        pid = self._await_pid(2.0)
+        if pid and pid > 0:
+            subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    self.container_id,
+                    "bash",
+                    "-c",
+                    f"pkill -{sig} -P {pid} 2>/dev/null; kill -{sig} {pid} 2>/dev/null; true",
+                ],
+                capture_output=True,
+                check=False,
+            )
+        else:
+            try:
+                self.proc.terminate() if sig == "TERM" else self.proc.kill()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        """Make sure the exec client and its drainer are gone."""
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+        self._drainer.close()
 
     def _ingest(self) -> None:
         """Pull the next block from the drainer and turn it into pending output:
@@ -542,26 +593,6 @@ class _RunningCommand:
         self._pid_parsed = True
         return rest
 
-    # ---- lifecycle -------------------------------------------------------
-
-    @property
-    def elapsed(self) -> float:
-        return time.monotonic() - self.started_at
-
-    @property
-    def idle(self) -> float:
-        return self._drainer.idle
-
-    def wait_exit(self, timeout: float) -> int | None:
-        """Return the command's exit code if it finishes within `timeout`, else
-        None. `docker exec` propagates the exec'd process's exit code."""
-        try:
-            self.proc.wait(timeout)
-        except subprocess.TimeoutExpired:
-            return None
-        self._drainer.join(timeout_sec=2)  # let the drainer capture the last bytes
-        return self.proc.returncode
-
     def _await_pid(self, timeout: float) -> int | None:
         deadline = time.monotonic() + timeout
         while self.pid is None and time.monotonic() < deadline:
@@ -570,38 +601,3 @@ class _RunningCommand:
                 break
             time.sleep(0.02)
         return self.pid
-
-    def signal(self, sig: str) -> None:
-        """Signal the in-container command by pid: its children (pkill -P) and
-        the command's bash itself. Falls back to killing the `docker exec`
-        client if the pid never arrived."""
-        pid = self._await_pid(2.0)
-        if pid and pid > 0:
-            subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    self.container_id,
-                    "bash",
-                    "-c",
-                    f"pkill -{sig} -P {pid} 2>/dev/null; kill -{sig} {pid} 2>/dev/null; true",
-                ],
-                capture_output=True,
-                check=False,
-            )
-        else:
-            try:
-                self.proc.terminate() if sig == "TERM" else self.proc.kill()
-            except OSError:
-                pass
-
-    def close(self) -> None:
-        """Make sure the exec client and its drainer are gone."""
-        try:
-            self.proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            try:
-                self.proc.kill()
-            except OSError:
-                pass
-        self._drainer.close()
