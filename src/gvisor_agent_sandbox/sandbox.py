@@ -484,11 +484,8 @@ class _RunningCommand:
         return cls(container_id, proc)
 
     def drain(self) -> str:
-        """Return output produced since the last call.
-
-        Pulls the next block of bytes from the drainer, strips the __PID__
-        header line once, and decodes the rest incrementally.
-        """
+        """Return output produced since the last call (empty if none yet)."""
+        # Pull the next block, strip the __PID__ header once, decode incrementally.
         self._ingest()
         out = self._pending
         self._pending = ""
@@ -503,21 +500,20 @@ class _RunningCommand:
         return self._drainer.idle
 
     def wait_exit(self, timeout: float) -> int | None:
-        """Return the command's exit code if it finishes within `timeout`, else
-        None. `docker exec` propagates the exec'd process's exit code."""
+        """Return the command's exit code if it finishes within `timeout`, else None."""
         try:
             self.proc.wait(timeout)
         except subprocess.TimeoutExpired:
             return None
         self._drainer.join(timeout_sec=2)  # let the drainer capture the last bytes
-        return self.proc.returncode
+        return self.proc.returncode  # docker exec propagates the command's exit code
 
     def signal(self, sig: str) -> None:
-        """Signal the in-container command by pid: its children (pkill -P) and
-        the command's bash itself. Falls back to killing the `docker exec`
-        client if the pid never arrived."""
+        """Send signal `sig` to the running command."""
         pid = self._await_pid(2.0)
         if pid and pid > 0:
+            # The pid is the bash the wrapper exec'd into; signal it and its
+            # children (pkill -P) so the whole command tree gets the signal.
             subprocess.run(
                 [
                     "docker",
@@ -531,6 +527,8 @@ class _RunningCommand:
                 check=False,
             )
         else:
+            # The pid never arrived (e.g. a very early kill); fall back to
+            # killing the docker exec client.
             try:
                 self.proc.terminate() if sig == "TERM" else self.proc.kill()
             except OSError:
