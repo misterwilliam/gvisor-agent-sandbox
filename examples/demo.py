@@ -1,5 +1,4 @@
-"""A scripted walkthrough of the sandbox - no LLM, just the sequence of tool
-calls an agent would make, so you can watch the interface work end to end.
+"""A scripted walkthrough of the sandbox.
 
 It runs the classic agent coding loop (write code, run it, see it fail, fix it,
 run it again) and then shows the timeout/wait, kill, and network-isolation
