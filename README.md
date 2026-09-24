@@ -1,16 +1,28 @@
 # gvisor-agent-sandbox
 
-A sandbox that gives an LLM agent shell access to an isolated environment: one
-[gVisor](https://gvisor.dev/)-isolated Docker container per session, driven from the host
-by running each command as its own `docker exec`. The threat model is a capable, possibly
-hostile agent, and the boundary is gVisor plus no network: the agent runs as root *inside*
-the container, but gVisor's sentry is itself deprivileged on the host, so container-root is
-not host-root; the harness and any API key stay on the host, never inside the container;
-and the container runs with `--network none`, so it has no egress to exfiltrate data, reach
-a command-and-control host, or attack third parties. Nothing from the host is mounted in -
-the agent's home directory `/root` is its workspace, and results are extracted from the
-container separately. Dependencies a task needs are baked into the image, not fetched at
-run time.
+A security sandbox suitable for hosting an AI agent. AI agent accesses the sandbox as a
+tool. Uses docker `runsc` runtime which uses [gVisor](https://gvisor.dev/) as the security
+sandbox.
+
+Simple usage example:
+
+```python
+from gvisor_agent_sandbox import Sandbox
+
+with Sandbox() as sbx:
+    sbx.shell_exec("ls")
+```
+
+A sandbox that gives an LLM agent shell access to an isolated environment: one -isolated
+Docker container per session, driven from the host by running each command as its own
+`docker exec`. The threat model is a capable, possibly hostile agent, and the boundary is
+gVisor plus no network: the agent runs as root _inside_ the container, but gVisor's sentry
+is itself deprivileged on the host, so container-root is not host-root; the harness and
+any API key stay on the host, never inside the container; and the container runs with
+`--network none`, so it has no egress to exfiltrate data, reach a command-and-control
+host, or attack third parties. Nothing from the host is mounted in - the agent's home
+directory `/root` is its workspace, and results are extracted from the container
+separately. Dependencies a task needs are baked into the image, not fetched at run time.
 
 ```python
 from gvisor_agent_sandbox import Sandbox
@@ -27,7 +39,7 @@ State persists at two very different levels, and only the durable one is kept:
 - **The container** (durable, kept): installed packages, files, and backgrounded processes
   live for the life of the sandbox.
 - **The shell session** (deliberately not kept): cwd, exported environment, and shell
-  functions do *not* carry from one command to the next. Each command is an independent
+  functions do _not_ carry from one command to the next. Each command is an independent
   `docker exec`.
 
 A human leans hard on shell-session state; an agent does not need it - it can emit
@@ -50,9 +62,9 @@ harness.
 - `shell_kill()`
 
 Every tool runs inside the container, so the container boundary is the only thing that has
-to hold: no tool touches the host filesystem at a path the agent chooses. Files are created
-through the shell, and a quoted heredoc carries content verbatim because the command is
-passed to bash as its own argv element rather than spliced into a command line.
+to hold: no tool touches the host filesystem at a path the agent chooses. Files are
+created through the shell, and a quoted heredoc carries content verbatim because the
+command is passed to bash as its own argv element rather than spliced into a command line.
 
 ## Requirements
 
@@ -68,16 +80,17 @@ inside it (key custody, audit-log integrity, artifact purity).
 A few non-obvious properties worth knowing before editing
 `src/gvisor_agent_sandbox/sandbox.py`:
 
-- Each command is one `docker exec ... bash -c 'echo "__PID__$$"; exec bash -c "$1" 2>&1'
-  bash <command>`. The command is passed as its own argv element (`$1`), never spliced into
-  a shell string, so arbitrary quotes, newlines, and backslashes need no escaping.
+- Each command is one
+  `docker exec ... bash -c 'echo "__PID__$$"; exec bash -c "$1" 2>&1' bash <command>`. The
+  command is passed as its own argv element (`$1`), never spliced into a shell string, so
+  arbitrary quotes, newlines, and backslashes need no escaping.
 - The `echo "__PID__$$"` before the `exec` (which preserves the pid) prints the pid of the
   bash that runs the command. That pid is what `shell_kill` signals; it arrives as the
   guaranteed-first output line, which the reader strips, so no command output can be
   mistaken for it.
-- `2>&1` merges stderr into stdout *inside the container*, because `docker exec` transports
-  the two as separate streams whose ordering is lost in transit - the merge has to happen
-  at the source.
+- `2>&1` merges stderr into stdout _inside the container_, because `docker exec`
+  transports the two as separate streams whose ordering is lost in transit - the merge has
+  to happen at the source.
 - A syntax error or a shell-fatal setting (`set -e` then a failure) just makes that one
   command's bash exit non-zero; there is no shared session to wedge, and the next command
   is unaffected.
@@ -108,11 +121,11 @@ uv run pytest                    # everything (~18s; needs Docker + gVisor)
 uv run pytest -m "not docker"    # pure logic only (~0.1s; runs anywhere)
 ```
 
-The suite is split so that half of it has no infrastructure requirements. `tests/`
-covers output truncation, result rendering, and the tool surface (dispatch and the
-not-running guards) without a container at all. The rest is marked `docker` and skipped
-with a printed reason when the runtime isn't available, so `uv run pytest` is safe on a
-machine that can't run containers.
+The suite is split so that half of it has no infrastructure requirements. `tests/` covers
+output truncation, result rendering, and the tool surface (dispatch and the not-running
+guards) without a container at all. The rest is marked `docker` and skipped with a printed
+reason when the runtime isn't available, so `uv run pytest` is safe on a machine that
+can't run containers.
 
 The container tests share one session-scoped sandbox - since commands carry no state
 between calls, the only per-test cleanup needed is killing a command a test left running -
