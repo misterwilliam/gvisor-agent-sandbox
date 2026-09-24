@@ -1,7 +1,9 @@
 # Exact copy of agent loop example in README.md
 # Run with:
-#  uv run --group examples python examples/agent_loop_readme.py
+# export ANTHROPIC_API_KEY=...
+# uv run --group examples python examples/agent_loop.py
 import sys
+
 import anthropic
 
 from gvisor_agent_sandbox import Sandbox

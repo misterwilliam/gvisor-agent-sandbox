@@ -13,10 +13,22 @@ with Sandbox() as sbx:
     sbx.shell_exec("ls")
 ```
 
+A sandbox that gives an LLM agent shell access to an isolated environment: one isolated
+Docker container per session, driven from the host by running each command as its own
+`docker exec`. The threat model is a capable, possibly hostile agent, and the boundary is
+gVisor plus no network: the agent runs as root _inside_ the container, but gVisor's sentry
+is itself deprivileged on the host, so container-root is not host-root; the harness and
+any API key stay on the host, never inside the container; and the container runs with
+`--network none`, so it has no egress to exfiltrate data, reach a command-and-control
+host, or attack third parties. Nothing from the host is mounted in - the agent's home
+directory `/root` is its workspace, and results are extracted from the container
+separately. Dependencies a task needs are baked into the image, not fetched at run time.
+
 The expected use case is within an agentic loop:
 
 ```python
 import sys
+
 import anthropic
 
 from gvisor_agent_sandbox import Sandbox
@@ -82,18 +94,6 @@ def main() -> int:
 if __name__ == "__main__":
     sys.exit(main())
 ```
-
-A sandbox that gives an LLM agent shell access to an isolated environment: one -isolated
-Docker container per session, driven from the host by running each command as its own
-`docker exec`. The threat model is a capable, possibly hostile agent, and the boundary is
-gVisor plus no network: the agent runs as root _inside_ the container, but gVisor's sentry
-is itself deprivileged on the host, so container-root is not host-root; the harness and
-any API key stay on the host, never inside the container; and the container runs with
-`--network none`, so it has no egress to exfiltrate data, reach a command-and-control
-host, or attack third parties. Nothing from the host is mounted in - the agent's home
-directory `/root` is its workspace, and results are extracted from the container
-separately. Dependencies a task needs are baked into the image, not fetched at run time.
-
 
 ## Why stateless commands instead of a persistent shell
 
