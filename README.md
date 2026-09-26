@@ -95,6 +95,45 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
+## Installation
+
+Requirements:
+
+- Linux with Docker
+- gVisor's `runsc` registered as a Docker runtime
+- [uv](https://docs.astral.sh/uv/)
+
+1. Install `runsc` by following
+   [gVisor's install guide](https://gvisor.dev/docs/user_guide/install/), then register it
+   with Docker:
+
+   ```sh
+   sudo runsc install  # adds the runsc runtime to /etc/docker/daemon.json
+   sudo systemctl restart docker
+   ```
+
+2. Add user to docker group, so that we can run Docker without sudo. The docker group has
+   root equivalent capabilities. This just allows us to run docker without sudo:
+
+   ```sh
+   sudo usermod -aG docker "$USER"
+   newgrp docker
+   ```
+
+3. Clone the repository and install its dependencies:
+
+   ```sh
+   git clone https://github.com/misterwilliam/gvisor-agent-sandbox.git
+   cd gvisor-agent-sandbox
+   uv sync  # add --group examples to also install what examples/agent_loop.py needs
+   ```
+
+4. Run the tests:
+
+   ```sh
+   uv run pytest
+   ```
+
 ## Why stateless commands instead of a persistent shell
 
 State persists at two very different levels, and only the durable one is kept:
@@ -128,12 +167,6 @@ Every tool runs inside the container, so the container boundary is the only thin
 to hold: no tool touches the host filesystem at a path the agent chooses. Files are
 created through the shell, and a quoted heredoc carries content verbatim because the
 command is passed to bash as its own argv element rather than spliced into a command line.
-
-## Requirements
-
-Docker, with the gVisor runtime registered as `runsc`, and the invoking user in the
-`docker` group (no sudo needed - if you just added yourself to the group, start a new
-shell for it to take effect).
 
 ## Design notes
 
