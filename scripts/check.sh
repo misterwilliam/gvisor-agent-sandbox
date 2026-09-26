@@ -3,8 +3,8 @@
 #
 # Checks formatting, linting, and the full test suite, cheapest first so it
 # fails fast. The test suite's container-backed tests need Docker with the
-# gVisor runtime registered as `runsc`; without it they skip themselves, and
-# only the pure-logic tests run.
+# gVisor runtime registered as `runsc`; without it the run stops and reports
+# what is missing.
 #
 # To fix what the check reports:
 #   uv run ruff format .          # reformat

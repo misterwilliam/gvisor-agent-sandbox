@@ -34,5 +34,5 @@ extend-select = ["I"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "docker: needs Docker with the gVisor runtime registered as `runsc` (auto-skipped otherwise)",
+    "docker: needs Docker with the gVisor runtime registered as `runsc` (the run stops without it)",
 ]

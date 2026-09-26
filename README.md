@@ -214,18 +214,7 @@ To run the testing steps individually:
 
 ```bash
 uv run pytest                    # everything (~18s; needs Docker + gVisor)
-uv run pytest -m "not docker"    # pure logic only (~0.1s; runs anywhere)
 ```
-
-The suite is split so that half of it has no infrastructure requirements. `tests/` covers
-output truncation, result rendering, and the tool surface (dispatch and the not-running
-guards) without a container at all. The rest is marked `docker` and skipped with a printed
-reason when the runtime isn't available, so `uv run pytest` is safe on a machine that
-can't run containers.
-
-The container tests share one session-scoped sandbox - since commands carry no state
-between calls, the only per-test cleanup needed is killing a command a test left running -
-which keeps the whole suite under twenty seconds.
 
 ## License
 

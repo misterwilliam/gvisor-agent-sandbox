@@ -1,8 +1,8 @@
 """Shared fixtures.
 
-The container-backed tests are marked `docker` and skipped with a reason when
-the runtime isn't there, so the pure-function tests still run anywhere -
-including CI, which has no gVisor.
+The container-backed tests are marked `docker` and need Docker with the gVisor
+runtime registered as `runsc`. If any selected test needs it and it isn't
+available, the run stops and says what is missing.
 """
 
 import functools
@@ -39,14 +39,15 @@ def _why_docker_unavailable() -> str | None:
     return None
 
 
-def pytest_collection_modifyitems(config, items):
-    reason = _why_docker_unavailable()
-    if reason is None:
+def pytest_collection_finish(session):
+    # Runs after -m/-k deselection, so a run that selects no docker tests never
+    # checks for Docker. Stopping here reports the problem once, instead of every
+    # container test erroring out on its own failed `docker run`.
+    if not any("docker" in item.keywords for item in session.items):
         return
-    skip = pytest.mark.skip(reason=f"needs Docker + gVisor: {reason}")
-    for item in items:
-        if "docker" in item.keywords:
-            item.add_marker(skip)
+    reason = _why_docker_unavailable()
+    if reason is not None:
+        pytest.exit(f"needs Docker + gVisor: {reason}", returncode=1)
 
 
 @pytest.fixture(scope="session")
