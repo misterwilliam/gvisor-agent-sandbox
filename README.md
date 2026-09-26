@@ -134,6 +134,10 @@ Requirements:
    uv run pytest
    ```
 
+   The first run downloads `python:3.12`, the sandbox's default image (about 1.6 GB), and
+   prints nothing while it does, so it can look stuck for a few minutes. To download it
+   ahead of time, run `docker pull python:3.12`.
+
 ## Why stateless commands instead of a persistent shell
 
 State persists at two very different levels, and only the durable one is kept:
