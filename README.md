@@ -13,18 +13,28 @@ with Sandbox() as sbx:
     sbx.shell_exec("ls")
 ```
 
-A sandbox that gives an LLM agent shell access to an isolated environment: one isolated
-Docker container per session, driven from the host by running each command as its own
-`docker exec`. The threat model is a capable, possibly hostile agent, and the boundary is
-gVisor plus no network: the agent runs as root _inside_ the container, but gVisor's sentry
-is itself deprivileged on the host, so container-root is not host-root; the harness and
-any API key stay on the host, never inside the container; and the container runs with
-`--network none`, so it has no egress to exfiltrate data, reach a command-and-control
-host, or attack third parties. Nothing from the host is mounted in - the agent's home
-directory `/root` is its workspace, and results are extracted from the container
-separately. Dependencies a task needs are baked into the image, not fetched at run time.
+The threat model is a sophisticated and malicious. The agent is hosted inside sandbox with
+the following security boundaries:
 
-The expected use case is within an agentic loop:
+- **gVisor.** The agent runs inside a gVisor sandbox. Sandbox is only as strong as gVisor.
+- **No network.** The container has no network access, so the agent cannot exfiltrate data
+  or reach other hosts. Libraries and packages the agent needs come from the Docker image
+  you choose (`Sandbox(image=...)`), since nothing can be downloaded at run time.
+- **Nothing from the host inside.** No host files are mounted into the container, and
+  memory, CPU, and process limits cap what a runaway process can consume.
+- **Harness and keys stay on the host.** The agent acts only through tools that run
+  commands inside the sandbox, so the harness and the API key are out of its reach.
+
+Access to the sandbox is provided through tools and therefore the harness runs on the
+host, but the agent is given no access to the host. This allows the LLM API keys to stay
+on the host accessible to the harness, but inaccessible to the agent which can only access
+the sandbox. Through the tools, the agent is allowed to:
+
+- `shell_exec(command, timeout)` - Run arbitrary bash commands within the sandbox
+- `shell_wait(timeout)` - Wait for running commands to finish
+- `shell_kill()` - Send SIGTERM then SIGKILL to currently executing command
+
+Example use case with agentic harness:
 
 ```python
 import sys
@@ -52,6 +62,7 @@ median of a list of numbers and raises ValueError on an empty list. Then write
 test_stats.py with unittest tests covering odd-length, even-length, and empty inputs.
 Run the tests and fix whatever fails until they all pass."""
 
+# Anthropic API key specified through ANTHROPIC_API_KEY environment variable.
 client = anthropic.Anthropic()
 messages: list[dict] = [{"role": "user", "content": TASK}]
 
@@ -63,6 +74,7 @@ def main() -> int:
                 model=MODEL,
                 max_tokens=4096,
                 system=SYSTEM,
+                # sbx.TOOLS provides registers the sandbox access with agent.
                 tools=sbx.TOOLS,
                 messages=messages,
             )
@@ -160,17 +172,6 @@ agent gets the output so far plus the choice to keep waiting (`shell_wait`) or s
 (`shell_kill`). A slow test suite and a hung process look identical to a fixed timeout but
 not to an agent holding the partial output, so the judgment call belongs there, not in the
 harness.
-
-## Tools
-
-- `shell_exec(command, timeout=None)`
-- `shell_wait(timeout=None)`
-- `shell_kill()`
-
-Every tool runs inside the container, so the container boundary is the only thing that has
-to hold: no tool touches the host filesystem at a path the agent chooses. Files are
-created through the shell, and a quoted heredoc carries content verbatim because the
-command is passed to bash as its own argv element rather than spliced into a command line.
 
 ## Design notes
 
