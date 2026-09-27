@@ -13,7 +13,7 @@ with Sandbox() as sbx:
     sbx.shell_exec("ls")
 ```
 
-The threat model is a sophisticated and malicious. The agent is hosted inside sandbox with
+The threat model is a sophisticated and malicious agent. The agent is hosted inside sandbox with
 the following security boundaries:
 
 - **gVisor.** The agent runs inside a gVisor sandbox. Sandbox is only as strong as gVisor.
