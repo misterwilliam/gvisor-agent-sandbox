@@ -1,4 +1,4 @@
-# Exact copy of agent loop example in README.md
+# Example usage of sandbox in an agentic loop.
 # Run with:
 # export ANTHROPIC_API_KEY=...
 # uv run --group examples python examples/agent_loop.py

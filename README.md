@@ -1,8 +1,9 @@
 # gvisor-agent-sandbox
 
-A security sandbox suitable for hosting an AI agent. AI agent accesses the sandbox as a
-tool. Uses docker `runsc` runtime which uses [gVisor](https://gvisor.dev/) as the security
-sandbox.
+A security sandbox suitable for hosting an AI agent. The AI agent accesses the sandbox as a
+tool. Sandbox is a wrapper around docker so it fits with container-based workflows and
+uses the docker `runsc` runtime (which uses [gVisor](https://gvisor.dev/)) for the
+security sandbox.
 
 Simple usage example:
 
@@ -13,15 +14,18 @@ with Sandbox() as sbx:
     sbx.shell_exec("ls")
 ```
 
-The threat model is a sophisticated and malicious agent. The agent is hosted inside sandbox with
-the following security boundaries:
+The threat model is a sophisticated and malicious agent. The agent is hosted inside the
+sandbox with the following security boundaries:
 
-- **gVisor.** The agent runs inside a gVisor sandbox. Sandbox is only as strong as gVisor.
-- **No network.** The container has no network access, so the agent cannot exfiltrate data
-  or reach other hosts. Libraries and packages the agent needs come from the Docker image
-  you choose (`Sandbox(image=...)`), since nothing can be downloaded at run time.
-- **Nothing from the host inside.** No host files are mounted into the container, and
-  memory, CPU, and process limits cap what a runaway process can consume.
+- **gVisor.** Docker `runsc` runtime uses the [gVisor](https://gvisor.dev/) security
+  sandbox to give each a VM-like security sandbox. The agent runs inside a gVisor sandbox,
+  so the sandbox is still vulnerable to gVisor vulnerabilities.
+- **No network.** The container has no network access, so the agent cannot perform attacks
+  that require external network access. Libraries and packages the agent needs come from
+  provided Docker image (`Sandbox(image=...)`), since nothing can be downloaded at run
+  time.
+- **Filesystem isolation from host.** No host files are mounted into the container.
+- **Resource limits.** Memory, CPU, and process limits cap resource consumption.
 - **Harness and keys stay on the host.** The agent acts only through tools that run
   commands inside the sandbox, so the harness and the API key are out of its reach.
 
@@ -37,74 +41,57 @@ the sandbox. Through the tools, the agent is allowed to:
 Example use case with agentic harness:
 
 ```python
-import sys
-
 import anthropic
-
 from gvisor_agent_sandbox import Sandbox
 
 MODEL = "claude-sonnet-5"
-
-SYSTEM = """You are working inside a Linux container that you drive with shell commands.
-
-You are root and your commands start in /root. Python 3.12 is available as python3.
-The container has no network access, so nothing can be installed - use the standard
-library only.
-
-Each shell_exec runs independently: the working directory resets to /root every time
-and environment variables do not carry over. The filesystem does persist. Chain state
-within a single command, or use absolute paths.
-
-Work until the task is done, then summarize what you built and stop."""
-
-TASK = """In /root, write stats.py containing a function median(values) that returns the
-median of a list of numbers and raises ValueError on an empty list. Then write
-test_stats.py with unittest tests covering odd-length, even-length, and empty inputs.
-Run the tests and fix whatever fails until they all pass."""
+SYSTEM = "..."
+TASK = "..."
 
 # Anthropic API key specified through ANTHROPIC_API_KEY environment variable.
 client = anthropic.Anthropic()
 messages: list[dict] = [{"role": "user", "content": TASK}]
 
+with Sandbox() as sbx:
+    for turn in range(10):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=SYSTEM,
+            # Provides agent access to sandbox as a tool.
+            tools=sbx.TOOLS,
+            messages=messages,
+        )
+        messages.append({"role": "assistant", "content": response.content})
 
-def main() -> int:
-    with Sandbox() as sbx:
-        for turn in range(10):
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=4096,
-                system=SYSTEM,
-                # sbx.TOOLS provides registers the sandbox access with agent.
-                tools=sbx.TOOLS,
-                messages=messages,
-            )
-            messages.append({"role": "assistant", "content": response.content})
+        results = []
+        for block in response.content:
+            if block.type == "text":
+                print(f"\n[{turn}] claude: {block.text}")
+            elif block.type == "tool_use":
+                print(f"\n[{turn}] {block.name}: {block.input}")
+                output = sbx.dispatch(block.name, block.input)
+                print("> " + output)
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": output,
+                    }
+                )
 
-            results = []
-            for block in response.content:
-                if block.type == "text":
-                    print(f"\n[{turn}] claude: {block.text}")
-                elif block.type == "tool_use":
-                    print(f"\n[{turn}] {block.name}: {block.input}")
-                    output = sbx.dispatch(block.name, block.input)
-                    print("> " + output)
-                    results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": output,
-                        }
-                    )
+        # No tool calls means the model is done talking to the container.
+        if not results:
+            print(f"\n=== finished after {turn} turns ({response.stop_reason}) ===")
+            break
+        messages.append({"role": "user", "content": results})
+```
 
-            # No tool calls means the model is done talking to the container.
-            if not results:
-                print(f"\n=== finished after {turn} turns ({response.stop_reason}) ===")
-                return 0
-            messages.append({"role": "user", "content": results})
+For a full example with agentic loop, see `examples/agent_loop.py` or run with:
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+```sh
+export ANTHROPIC_API_KEY=...
+uv run --group examples python examples/agent_loop.py
 ```
 
 ## Installation
