@@ -1,7 +1,7 @@
 # gvisor-agent-sandbox
 
-A security sandbox suitable for hosting an AI agent. The AI agent accesses the sandbox as a
-tool. Sandbox is a wrapper around docker so it fits with container-based workflows and
+A security sandbox suitable for hosting an AI agent. The AI agent accesses the sandbox as
+a tool. Sandbox is a wrapper around docker so it fits with container-based workflows and
 uses the docker `runsc` runtime (which uses [gVisor](https://gvisor.dev/)) for the
 security sandbox.
 
@@ -32,11 +32,7 @@ sandbox with the following security boundaries:
 Access to the sandbox is provided through tools and therefore the harness runs on the
 host, but the agent is given no access to the host. This allows the LLM API keys to stay
 on the host accessible to the harness, but inaccessible to the agent which can only access
-the sandbox. Through the tools, the agent is allowed to:
-
-- `shell_exec(command, timeout)` - Run arbitrary bash commands within the sandbox
-- `shell_wait(timeout)` - Wait for running commands to finish
-- `shell_kill()` - Send SIGTERM then SIGKILL to currently executing command
+the sandbox.
 
 Example use case with agentic harness:
 
@@ -137,28 +133,34 @@ Requirements:
    prints nothing while it does, so it can look stuck for a few minutes. To download it
    ahead of time, run `docker pull python:3.12`.
 
-## Why stateless commands instead of a persistent shell
+## Sandbox API exposed to the agent
 
-State persists at two very different levels, and only the durable one is kept:
+The agent gets three tools:
 
-- **The container** (durable, kept): installed packages, files, and backgrounded processes
-  live for the life of the sandbox.
-- **The shell session** (deliberately not kept): cwd, exported environment, and shell
-  functions do _not_ carry from one command to the next. Each command is an independent
-  `docker exec`.
+- `shell_exec(command, timeout)` - run a bash command in the sandbox. Returns the exit
+  code and output, with stdout and stderr interleaved as they would appear in a terminal.
+- `shell_wait(timeout)` - keep waiting for the running command and get its new output.
+- `shell_kill()` - stop the running command (SIGTERM, then SIGKILL).
 
-A human leans hard on shell-session state; an agent does not need it - it can emit
-absolute paths and chain state within a single command (`cd src && make`). Dropping the
-persistent shell removes the whole problem of detecting when a command has finished on a
-shared stream: with one process per command, "done" is just the process exiting, output
-comes straight off that process's pipe, and there is no host-side file for command text or
-output - and so none of the attack surface one brings.
+Commands run as root, starting in `/root`. Each command is a separate process. A command
+that runs past its timeout keeps running; the agent gets the output so far and decides
+whether to wait or kill it. Only one command can run at a time. Long output is cut down to
+its first and last 15,000 characters.
 
-A command that outruns its timeout is not treated as an error - it keeps running, and the
-agent gets the output so far plus the choice to keep waiting (`shell_wait`) or stop it
-(`shell_kill`). A slow test suite and a hung process look identical to a fixed timeout but
-not to an agent holding the partial output, so the judgment call belongs there, not in the
-harness.
+Sandboxed agent is exposed to the agent access to a docker image where they can run a bash
+command with every tool call. Side effects of the each bash command persist across tool
+calls, but the sandbox is not given a persistent bash session across tools calls. So
+changes to environment variables or current working directory are not persisted. The
+rationale for this design choice is because:
+
+1. A persistent shell where `cd` and defining environment variables carry over are what
+   make terminal sessions for humans, but they are not necessary for agents which can use
+   absolute paths, chain multiple commands within on command, and carry over the necessary
+   environment variables across tool calls.
+2. With a persistent shell, the harness needs to detect when the output of a command ends.
+   Humans watch for the shell prompt to detect when a command returns, but a malicious
+   agent can change the prompt or inject fake end of command markers. Adding logic within
+   the harness to handle these scenarios adds a complicated potential attack surface.
 
 ## Design notes
 

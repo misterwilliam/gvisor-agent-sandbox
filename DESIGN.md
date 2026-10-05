@@ -2,7 +2,8 @@
 
 ## Objective
 
-Create an agentic sandbox. Agents access the sandbox through tools.
+Create an agentic sandbox. Agents access the sandbox through tools. Agent is assumed to
+sophisticated and malicious.
 
 ## Design
 
@@ -35,8 +36,7 @@ State persists at two very different levels, and only the durable one is kept:
 - **Shell session (not kept).** cwd, exported environment, shell functions. Each command
   runs as its own `docker exec`, so none of this carries from one command to the next.
 
-The reasoning is in the README ("Why stateless commands instead of a persistent shell"): a
-human needs shell-session state, an agent does not (absolute paths, chaining within one
+A human needs shell-session state, an agent does not (absolute paths, chaining within one
 command), and dropping the persistent shell removes the completion-detection problem that
 a shared, long-lived stream forces. Detecting when a command has finished on a shared bash
 stream is impossible without either reinterpreting the command or injecting a sentinel and
