@@ -32,11 +32,15 @@ yourself, start a new shell for it to take effect).
 """
 
 import codecs
+import logging
 import subprocess
+import threading
 import time
 import typing
 
-from .stream import AssertAndDiscardStreamPrefix, FdDrainer
+from .stream import AssertAndDiscardStreamPrefix, FdDrainer, StreamPrefixError
+
+_log = logging.getLogger(__name__)
 
 # Full python image (not -slim) is based on buildpack-deps, so it ships gcc,
 # make, and friends - enough for "write a C compiler"-shaped tasks without a
@@ -47,8 +51,10 @@ DEFAULT_IMAGE = "python:3.12"
 # logs would otherwise dominate the context window over a long run.
 MAX_OUTPUT_BYTES = 30_000
 
-# How many commands can run at once. shell_exec is rejected while this many are running.
-MAX_RUNNING_COMMANDS = 1
+# How many commands can run at once. Each running command holds a `docker exec` process
+# and a reader thread on the host, so this also bounds what the agent can use outside the
+# container.
+MAX_RUNNING_COMMANDS = 64
 
 
 class Sandbox:
@@ -79,8 +85,9 @@ class Sandbox:
                 + "\n\nIf the command is still running when the timeout expires, you get the "
                 "output so far instead of an error - the command keeps running. The result "
                 "names the command's id; pass it to shell_wait to keep waiting or to "
-                "shell_kill to stop it. You cannot start another command until the running "
-                "one finishes or is killed."
+                "shell_kill to stop it. You can run other commands while one is running - "
+                "for example, start a server and then query it - and each has its own id. "
+                f"Up to {MAX_RUNNING_COMMANDS} commands can run at once."
             ),
             "input_schema": {
                 "type": "object",
@@ -164,6 +171,11 @@ class Sandbox:
         self._commands: dict[int, SandboxedShellCommand] = {}
         # Ids increase and are never reused, so a stale id can't refer to a newer command.
         self._next_command_id = 1
+        # Guards container_id, _commands, and _next_command_id, so the tools can be
+        # called from several threads at once. It is only held for bookkeeping, never
+        # while waiting on a command, so a long shell_wait on one thread doesn't block
+        # calls on another.
+        self._lock = threading.Lock()
 
     def start(self) -> None:
         # Start container and sleep forever.
@@ -190,21 +202,26 @@ class Sandbox:
         result = subprocess.run(cmd, capture_output=True, check=False, text=True)
         if result.returncode != 0:
             raise SandboxError(f"failed to start container: {result.stderr.strip()}")
-        self.container_id = result.stdout.strip()
+        with self._lock:
+            self.container_id = result.stdout.strip()
 
     def stop(self) -> None:
-        for command in self._commands.values():
-            command.signal("KILL")
-            command.close()
-        self._commands.clear()
-        if self.container_id is not None:
+        # Removing the container ends every command running in it, so the commands are
+        # only closed afterwards, never signaled: signaling reads a command's output,
+        # which can raise, and nothing may stop the container from being removed.
+        with self._lock:
+            container_id, self.container_id = self.container_id, None
+            commands = list(self._commands.values())
+            self._commands.clear()
+        if container_id is not None:
             subprocess.run(
-                ["docker", "rm", "-f", self.container_id],
+                ["docker", "rm", "-f", container_id],
                 capture_output=True,
                 check=False,
                 text=True,
             )
-            self.container_id = None
+        for command in commands:
+            command.close()
 
     def __enter__(self) -> typing.Self:
         self.start()
@@ -217,44 +234,50 @@ class Sandbox:
 
     def shell_exec(self, command: str, timeout: int | None = None) -> ShellResult:
         """Run `command` and wait up to `timeout` seconds for it to finish."""
-        if self.container_id is None:
-            return ShellResult(status="rejected", note="sandbox is not running")
-        if len(self._commands) >= MAX_RUNNING_COMMANDS:
-            return ShellResult(
-                status="rejected",
-                note=(
-                    f"the limit of {MAX_RUNNING_COMMANDS} running command(s) is reached "
-                    f"({self._running_ids()}). Use shell_wait to keep waiting or shell_kill "
-                    "to stop one before running something else."
-                ),
+        # Checking the limit, starting the exec, and registering it happen under one
+        # lock, so threads starting commands at once can't overshoot the limit, and
+        # stop() either sees the command or prevents it from starting.
+        with self._lock:
+            if self.container_id is None:
+                return ShellResult(status="rejected", note="sandbox is not running")
+            if len(self._commands) >= MAX_RUNNING_COMMANDS:
+                return ShellResult(
+                    status="rejected",
+                    note=(
+                        f"{MAX_RUNNING_COMMANDS} commands are already running "
+                        f"({self._running_ids()}), which is the limit. Use shell_wait or "
+                        "shell_kill to finish one before starting another."
+                    ),
+                )
+            command_id = self._next_command_id
+            self._next_command_id += 1
+            running = SandboxedShellCommand.start(
+                command_id, self.container_id, Sandbox.ROOT_USER_HOME_DIR, command
             )
-        command_id = self._next_command_id
-        self._next_command_id += 1
-        running = SandboxedShellCommand.start(
-            command_id, self.container_id, Sandbox.ROOT_USER_HOME_DIR, command
-        )
-        self._commands[command_id] = running
+            self._commands[command_id] = running
         timeout = timeout if timeout is not None else self.exec_timeout
-        return self._forget_if_finished(running.wait(timeout))
+        return self._collect(running, lambda: running.wait(timeout))
 
     def shell_wait(self, command_id: int, timeout: int | None = None) -> ShellResult:
         """Wait up to `timeout` more seconds for command `command_id` to finish."""
-        if self.container_id is None:
-            return ShellResult(status="rejected", note="sandbox is not running")
-        running = self._commands.get(command_id)
-        if running is None:
-            return self._unknown_command(command_id)
+        with self._lock:
+            if self.container_id is None:
+                return ShellResult(status="rejected", note="sandbox is not running")
+            running = self._commands.get(command_id)
+            if running is None:
+                return self._unknown_command(command_id)
         timeout = timeout if timeout is not None else self.exec_timeout
-        return self._forget_if_finished(running.wait(timeout))
+        return self._collect(running, lambda: running.wait(timeout))
 
     def shell_kill(self, command_id: int) -> ShellResult:
         """Stop command `command_id`."""
-        if self.container_id is None:
-            return ShellResult(status="rejected", note="sandbox is not running")
-        running = self._commands.get(command_id)
-        if running is None:
-            return self._unknown_command(command_id)
-        return self._forget_if_finished(running.kill())
+        with self._lock:
+            if self.container_id is None:
+                return ShellResult(status="rejected", note="sandbox is not running")
+            running = self._commands.get(command_id)
+            if running is None:
+                return self._unknown_command(command_id)
+        return self._collect(running, running.kill)
 
     def dispatch(self, tool_name: str, tool_input: dict) -> str:
         """Route a tool_use block to the matching method and return the text the model
@@ -272,20 +295,47 @@ class Sandbox:
 
     # ---- internals -------------------------------------------------------
 
-    def _forget_if_finished(self, result: ShellResult) -> ShellResult:
+    def _collect(
+        self, running: SandboxedShellCommand, action: typing.Callable[[], ShellResult]
+    ) -> ShellResult:
+        """Return the result of `action` on a running command, and forget the command
+        once it has finished or failed."""
+        try:
+            result = action()
+        except StreamPrefixError as e:
+            # The exec's output did not start with the expected __PID__ line, so it
+            # can't be trusted to be the command's own output - for example, when
+            # docker exec failed to start the command. None of it reaches the agent.
+            _log.warning("command %d: discarding untrusted output: %s", running.id, e)
+            result = ShellResult(
+                status="failed",
+                note=(
+                    f"command {running.id} could not be run in the sandbox, so no output "
+                    "is available. This can happen when the sandbox is out of resources; "
+                    "stopping other commands may help."
+                ),
+                command_id=running.id,
+            )
         # A command stays registered until its final result has been returned, so its
-        # last output and exit code can't be lost.
+        # last output and exit code can't be lost. Two threads can both see it finish
+        # (say, a wait and a kill), or stop() can get there first; only whoever removes
+        # it from the registry closes it.
         if result.status != "running":
-            self._commands.pop(result.command_id).close()
+            with self._lock:
+                finished = self._commands.pop(running.id, None)
+            if finished is not None:
+                finished.close()
         return result
 
     def _unknown_command(self, command_id: object) -> ShellResult:
+        # The caller holds self._lock.
         return ShellResult(
             status="rejected",
             note=f"no running command {command_id!r} ({self._running_ids()})",
         )
 
     def _running_ids(self) -> str:
+        # The caller holds self._lock.
         if not self._commands:
             return "no commands are running"
         return "running: " + ", ".join(str(i) for i in sorted(self._commands))
@@ -320,6 +370,8 @@ class ShellResult:
       running   - still going; the agent chooses wait or kill
       killed    - terminated on request; exit_code is the signal's, if known
       rejected  - the call didn't make sense in the current state
+      failed    - the command couldn't be run, or its output couldn't be trusted;
+                  no output is returned
     """
 
     def __init__(
@@ -342,7 +394,7 @@ class ShellResult:
 
     def __str__(self) -> str:
         """The text the model receives for this result."""
-        if self.status == "rejected":
+        if self.status in ("rejected", "failed"):
             return f"ERROR: {self.note}"
 
         label = f"command {self.command_id}: " if self.command_id is not None else ""
@@ -420,6 +472,9 @@ class SandboxedShellCommand:
             errors="replace"
         )
         self._pending = ""  # decoded output produced but not yet returned by drain()
+        # Guards the output state above (prefix check, pid, decoder, pending output):
+        # a wait and a kill on different threads can both read this command's output.
+        self._output_lock = threading.Lock()
 
     @classmethod
     def start(
@@ -515,10 +570,11 @@ class SandboxedShellCommand:
     def drain(self) -> str:
         """Return output produced since the last call (empty if none yet)."""
         # Pull the next block, strip the __PID__ header once, decode incrementally.
-        self._ingest()
-        out = self._pending
-        self._pending = ""
-        return out
+        with self._output_lock:
+            self._ingest()
+            out = self._pending
+            self._pending = ""
+            return out
 
     @property
     def elapsed(self) -> float:
@@ -582,6 +638,7 @@ class SandboxedShellCommand:
         pid as a side effect - so output pulled while waiting for the pid is held
         in `_pending` for the next `drain`, never lost.
         """
+        # The caller holds self._output_lock.
         if self._decoder is None:
             return  # a final decode already flushed the decoder at EOF
         block = self._drainer.read()
@@ -623,7 +680,8 @@ class SandboxedShellCommand:
     def _await_pid(self, timeout: float) -> int | None:
         deadline = time.monotonic() + timeout
         while self.pid is None and time.monotonic() < deadline:
-            self._ingest()  # parses the pid as a side effect; any output goes to _pending
+            with self._output_lock:
+                self._ingest()  # parses the pid as a side effect; output goes to _pending
             if self.pid is not None:
                 break
             time.sleep(0.02)

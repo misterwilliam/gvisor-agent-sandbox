@@ -147,8 +147,9 @@ The agent gets three tools:
 
 Commands run as root, starting in `/root`. Each command is a separate process. A command
 that runs past its timeout keeps running; the agent gets the output so far and decides
-whether to wait or kill it. Only one command can run at a time. Long output is cut down to
-its first and last 15,000 characters.
+whether to wait or kill it. Up to 32 commands can run at once, so the agent can start a
+server in one command and query it from another. Long output is cut down to its first and
+last 15,000 characters.
 
 Sandboxed agent is exposed to the agent access to a docker image where they can run a bash
 command with every tool call. Side effects of the each bash command persist across tool

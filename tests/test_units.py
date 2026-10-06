@@ -45,6 +45,11 @@ def test_rejected_renders_as_the_reason_alone():
     assert str(result) == "ERROR: no running command 9"
 
 
+def test_failed_renders_as_an_error():
+    result = ShellResult(status="failed", note="command 5 could not be run", command_id=5)
+    assert str(result) == "ERROR: command 5 could not be run"
+
+
 def test_completed_renders_exit_code_and_output():
     rendered = str(ShellResult("hello\n", exit_code=0))
     assert "exit=0" in rendered
