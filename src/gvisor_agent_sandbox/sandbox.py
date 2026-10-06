@@ -341,21 +341,6 @@ class Sandbox:
         return "running: " + ", ".join(str(i) for i in sorted(self._commands))
 
 
-class SandboxError(Exception):
-    """Raised when the container fails to start."""
-
-
-def _truncate(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
-    """Keep the head and tail of oversized output; errors usually live at the
-    end, context usually at the start."""
-    if len(text) <= limit:
-        return text
-    head = text[: limit // 2]
-    tail = text[-(limit // 2) :]
-    dropped = len(text) - len(head) - len(tail)
-    return f"{head}\n... [{dropped} characters truncated] ...\n{tail}"
-
-
 class ShellResult:
     """One command's outcome, in whatever state it's currently in.
 
@@ -424,6 +409,10 @@ class ShellResult:
             parts.append(f"[{self.note}]")
         parts.append(f"output:\n{_truncate(self.output)}")
         return "\n".join(parts)
+
+
+class SandboxError(Exception):
+    """Raised when the container fails to start."""
 
 
 class SandboxedShellCommand:
@@ -686,3 +675,14 @@ class SandboxedShellCommand:
                 break
             time.sleep(0.02)
         return self.pid
+
+
+def _truncate(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
+    """Keep the head and tail of oversized output; errors usually live at the
+    end, context usually at the start."""
+    if len(text) <= limit:
+        return text
+    head = text[: limit // 2]
+    tail = text[-(limit // 2) :]
+    dropped = len(text) - len(head) - len(tail)
+    return f"{head}\n... [{dropped} characters truncated] ...\n{tail}"
