@@ -10,10 +10,10 @@ integration tests). Run it with:
     uv run python examples/demo.py
 """
 
-from gvisor_agent_sandbox import Sandbox
+from gvisor_agent_sandbox import Sandbox, ShellResult
 
 
-def show(title: str, result: str) -> None:
+def show(title: str, result: ShellResult) -> None:
     print(f"\n=== {title} ===")
     print(result)
 
@@ -40,15 +40,14 @@ def main() -> None:
         show("the file written earlier is still there", sbx.shell_exec("ls -l sum.py"))
 
         # A slow command: the call times out with a snapshot, then we wait it out.
-        show(
-            "start a 3s command with a 1s budget -> still running",
-            sbx.shell_exec("echo working...; sleep 3; echo done", timeout=1),
-        )
-        show("wait for it to finish", sbx.shell_wait(timeout=10))
+        slow = sbx.shell_exec("echo working...; sleep 3; echo done", timeout=1)
+        show("start a 3s command with a 1s budget -> still running", slow)
+        show("wait for it to finish", sbx.shell_wait(slow.command_id, timeout=10))
 
         # A stuck command: start it, then stop it.
-        show("start a stuck command", sbx.shell_exec("sleep 300", timeout=1))
-        show("kill it", sbx.shell_kill())
+        stuck = sbx.shell_exec("sleep 300", timeout=1)
+        show("start a stuck command", stuck)
+        show("kill it", sbx.shell_kill(stuck.command_id))
 
         # Isolation: the container has no network.
         show(

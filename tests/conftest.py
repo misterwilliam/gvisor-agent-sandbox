@@ -56,25 +56,25 @@ def sbx():
 
     A fresh container per test would be cleaner but takes seconds each. Commands
     carry no session state between calls, so the only thing that can leak across
-    tests is a command left running; `_free_runner` clears that. (The workspace
-    filesystem is shared, so tests use distinct paths under /root.)
+    tests is a command left running; `_kill_leftover_commands` clears that. (The
+    workspace filesystem is shared, so tests use distinct paths under /root.)
     """
     with Sandbox() as sandbox:
         yield sandbox
 
 
 @pytest.fixture(autouse=True)
-def _free_runner(request):
+def _kill_leftover_commands(request):
     """Kill any command a test left running, so the next test isn't rejected.
 
     There is no shell session to reset - each command is independent - so this
-    only has to clear a still-running command (e.g. a test that returned without
+    only has to clear still-running commands (e.g. a test that returned without
     killing one, or failed mid-command).
     """
     yield
 
     if "sbx" not in request.fixturenames:
         return  # a test that never touched the container
-    runner = request.getfixturevalue("sbx").runner
-    if runner is not None and runner._running is not None:
-        runner.kill()
+    sandbox = request.getfixturevalue("sbx")
+    for command_id in list(sandbox._commands):
+        sandbox.shell_kill(command_id)

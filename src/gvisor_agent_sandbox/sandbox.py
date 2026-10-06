@@ -47,6 +47,9 @@ DEFAULT_IMAGE = "python:3.12"
 # logs would otherwise dominate the context window over a long run.
 MAX_OUTPUT_BYTES = 30_000
 
+# How many commands can run at once. shell_exec is rejected while this many are running.
+MAX_RUNNING_COMMANDS = 1
+
 
 class Sandbox:
     """A running gVisor container the agent drives through tools.
@@ -74,9 +77,10 @@ class Sandbox:
                 "home directory which is /root.\n\n"
                 + _EXEC_NOTE
                 + "\n\nIf the command is still running when the timeout expires, you get the "
-                "output so far instead of an error - the command keeps running. Use "
-                "shell_wait to keep waiting or shell_kill to stop it. You cannot start "
-                "another command until the running one finishes or is killed."
+                "output so far instead of an error - the command keeps running. The result "
+                "names the command's id; pass it to shell_wait to keep waiting or to "
+                "shell_kill to stop it. You cannot start another command until the running "
+                "one finishes or is killed."
             ),
             "input_schema": {
                 "type": "object",
@@ -96,31 +100,46 @@ class Sandbox:
         {
             "name": "shell_wait",
             "description": (
-                "Keep waiting for the command that is currently running. Returns any output "
-                "produced since the last call, plus how long the command has been running "
-                "and whether it is still producing output - a build that is still printing "
-                "is progressing, while one that has been silent for a long time may be "
-                "stuck. If the command finishes, you get its exit code."
+                "Keep waiting for a running command, identified by the id shell_exec "
+                "reported. Returns any output produced since the last call, plus how long "
+                "the command has been running and whether it is still producing output - a "
+                "build that is still printing is progressing, while one that has been "
+                "silent for a long time may be stuck. If the command finishes, you get its "
+                "exit code."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
+                    "command_id": {
+                        "type": "integer",
+                        "description": "The id of the command, as reported by shell_exec.",
+                    },
                     "timeout": {
                         "type": "integer",
                         "description": "Additional seconds to wait. Default 60.",
                     },
                 },
-                "required": [],
+                "required": ["command_id"],
             },
         },
         {
             "name": "shell_kill",
             "description": (
-                "Terminate the command that is currently running. Sends SIGTERM, then "
-                "SIGKILL if that does not work. Returns any remaining output and the exit "
-                "status. The container and its filesystem are unaffected."
+                "Terminate a running command, identified by the id shell_exec reported. "
+                "Sends SIGTERM, then SIGKILL if that does not work. Returns any remaining "
+                "output and the exit status. The container and its filesystem are "
+                "unaffected."
             ),
-            "input_schema": {"type": "object", "properties": {}, "required": []},
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command_id": {
+                        "type": "integer",
+                        "description": "The id of the command, as reported by shell_exec.",
+                    },
+                },
+                "required": ["command_id"],
+            },
         },
     ]
 
@@ -141,7 +160,10 @@ class Sandbox:
         self.pids_limit = pids_limit
         self.exec_timeout = exec_timeout
         self.container_id: str | None = None
-        self.runner: Command | None = None
+        # Commands that have started but whose final result hasn't been returned yet.
+        self._commands: dict[int, SandboxedShellCommand] = {}
+        # Ids increase and are never reused, so a stale id can't refer to a newer command.
+        self._next_command_id = 1
 
     def start(self) -> None:
         # Start container and sleep forever.
@@ -169,12 +191,12 @@ class Sandbox:
         if result.returncode != 0:
             raise SandboxError(f"failed to start container: {result.stderr.strip()}")
         self.container_id = result.stdout.strip()
-        self.runner = Command(self.container_id, Sandbox.ROOT_USER_HOME_DIR, self.exec_timeout)
 
     def stop(self) -> None:
-        if self.runner is not None:
-            self.runner.close()
-            self.runner = None
+        for command in self._commands.values():
+            command.signal("KILL")
+            command.close()
+        self._commands.clear()
         if self.container_id is not None:
             subprocess.run(
                 ["docker", "rm", "-f", self.container_id],
@@ -193,124 +215,84 @@ class Sandbox:
 
     # ---- tool implementations -------------------------------------------
 
-    def shell_exec(self, command: str, timeout: int | None = None) -> str:
-        if self.runner is None:
-            return "ERROR: sandbox is not running"
-        return self.runner.run(command, timeout).render()
+    def shell_exec(self, command: str, timeout: int | None = None) -> ShellResult:
+        """Run `command` and wait up to `timeout` seconds for it to finish."""
+        if self.container_id is None:
+            return ShellResult(status="rejected", note="sandbox is not running")
+        if len(self._commands) >= MAX_RUNNING_COMMANDS:
+            return ShellResult(
+                status="rejected",
+                note=(
+                    f"the limit of {MAX_RUNNING_COMMANDS} running command(s) is reached "
+                    f"({self._running_ids()}). Use shell_wait to keep waiting or shell_kill "
+                    "to stop one before running something else."
+                ),
+            )
+        command_id = self._next_command_id
+        self._next_command_id += 1
+        running = SandboxedShellCommand.start(
+            command_id, self.container_id, Sandbox.ROOT_USER_HOME_DIR, command
+        )
+        self._commands[command_id] = running
+        timeout = timeout if timeout is not None else self.exec_timeout
+        return self._forget_if_finished(running.wait(timeout))
 
-    def shell_wait(self, timeout: int | None = None) -> str:
-        if self.runner is None:
-            return "ERROR: sandbox is not running"
-        return self.runner.wait(timeout).render()
+    def shell_wait(self, command_id: int, timeout: int | None = None) -> ShellResult:
+        """Wait up to `timeout` more seconds for command `command_id` to finish."""
+        if self.container_id is None:
+            return ShellResult(status="rejected", note="sandbox is not running")
+        running = self._commands.get(command_id)
+        if running is None:
+            return self._unknown_command(command_id)
+        timeout = timeout if timeout is not None else self.exec_timeout
+        return self._forget_if_finished(running.wait(timeout))
 
-    def shell_kill(self) -> str:
-        if self.runner is None:
-            return "ERROR: sandbox is not running"
-        return self.runner.kill().render()
+    def shell_kill(self, command_id: int) -> ShellResult:
+        """Stop command `command_id`."""
+        if self.container_id is None:
+            return ShellResult(status="rejected", note="sandbox is not running")
+        running = self._commands.get(command_id)
+        if running is None:
+            return self._unknown_command(command_id)
+        return self._forget_if_finished(running.kill())
 
     def dispatch(self, tool_name: str, tool_input: dict) -> str:
-        """Route a tool_use block to the matching method."""
+        """Route a tool_use block to the matching method and return the text the model
+        sees."""
+        # A missing or malformed command_id is passed through as-is: it matches no
+        # running command, so the model gets an error result rather than the harness
+        # raising.
         if tool_name == "shell_exec":
-            return self.shell_exec(tool_input["command"], tool_input.get("timeout"))
+            return str(self.shell_exec(tool_input["command"], tool_input.get("timeout")))
         if tool_name == "shell_wait":
-            return self.shell_wait(tool_input.get("timeout"))
+            return str(self.shell_wait(tool_input.get("command_id"), tool_input.get("timeout")))
         if tool_name == "shell_kill":
-            return self.shell_kill()
+            return str(self.shell_kill(tool_input.get("command_id")))
         return f"ERROR: unknown tool {tool_name!r}"
+
+    # ---- internals -------------------------------------------------------
+
+    def _forget_if_finished(self, result: ShellResult) -> ShellResult:
+        # A command stays registered until its final result has been returned, so its
+        # last output and exit code can't be lost.
+        if result.status != "running":
+            self._commands.pop(result.command_id).close()
+        return result
+
+    def _unknown_command(self, command_id: object) -> ShellResult:
+        return ShellResult(
+            status="rejected",
+            note=f"no running command {command_id!r} ({self._running_ids()})",
+        )
+
+    def _running_ids(self) -> str:
+        if not self._commands:
+            return "no commands are running"
+        return "running: " + ", ".join(str(i) for i in sorted(self._commands))
 
 
 class SandboxError(Exception):
     """Raised when the container fails to start."""
-
-
-class Command:
-    """Represents one command.
-
-    Supports waiting on command to return till timeout, and killing the command.
-    """
-
-    def __init__(
-        self, container_id: str, cwd: str = Sandbox.ROOT_USER_HOME_DIR, default_timeout: int = 60
-    ):
-        self.container_id = container_id
-        self.cwd = cwd
-        self.default_timeout = default_timeout
-        self._running: _RunningCommand | None = None
-
-    def run(self, command: str, timeout: int | None = None) -> ShellResult:
-        timeout = timeout if timeout is not None else self.default_timeout
-        if self._running is not None:
-            return ShellResult(
-                status="rejected",
-                note=(
-                    f"a command has been running for {self._running.elapsed:.0f}s. "
-                    "Use shell_wait to keep waiting or shell_kill to stop it before "
-                    "running something else."
-                ),
-            )
-        self._running = _RunningCommand.start(self.container_id, self.cwd, command)
-        return self._settle(timeout)
-
-    def wait(self, timeout: int | None = None) -> ShellResult:
-        timeout = timeout if timeout is not None else self.default_timeout
-        if self._running is None:
-            return ShellResult(status="rejected", note="no command is currently running")
-        return self._settle(timeout)
-
-    def kill(self) -> ShellResult:
-        if self._running is None:
-            return ShellResult(status="rejected", note="no command is currently running")
-
-        elapsed = self._running.elapsed
-        # TERM first, then KILL. Grandchildren (make -> gcc) can survive as
-        # orphans, which is tolerable because the container is the real boundary
-        # and is disposable.
-        for sig, grace in (("TERM", 5), ("KILL", 5)):
-            self._running.signal(sig)
-            code = self._running.wait_exit(grace)
-            if code is not None:
-                output = self._running.drain()
-                self._finish()
-                return ShellResult(
-                    output, exit_code=code, status="killed", note=f"SIG{sig} after {elapsed:.0f}s"
-                )
-
-        # The in-container process is unkillable via signals (should not happen
-        # under gVisor); drop the exec client and move on.
-        output = self._running.drain()
-        self._running.close()
-        self._running = None
-        return ShellResult(
-            output, status="killed", note=f"could not confirm exit after {elapsed:.0f}s"
-        )
-
-    def close(self) -> None:
-        """Kill any in-flight command; called on sandbox teardown."""
-        if self._running is not None:
-            self._running.signal("KILL")
-            self._running.close()
-            self._running = None
-
-    # ---- internals -------------------------------------------------------
-
-    def _settle(self, timeout: int) -> ShellResult:
-        assert self._running is not None
-        code = self._running.wait_exit(timeout)
-        if code is not None:
-            output = self._running.drain()
-            self._finish()
-            return ShellResult(output, exit_code=code, status="completed")
-        return ShellResult(
-            self._running.drain(),
-            status="running",
-            elapsed=self._running.elapsed,
-            idle=self._running.idle,
-        )
-
-    def _finish(self) -> None:
-        if self._running is not None:
-            self._running.close()
-            self._running = None
 
 
 def _truncate(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
@@ -348,6 +330,7 @@ class ShellResult:
         note: str = "",
         elapsed: float | None = None,
         idle: float | None = None,
+        command_id: int | None = None,
     ):
         self.output = output
         self.exit_code = exit_code
@@ -355,13 +338,16 @@ class ShellResult:
         self.note = note
         self.elapsed = elapsed
         self.idle = idle
+        self.command_id = command_id
 
-    def render(self) -> str:
+    def __str__(self) -> str:
+        """The text the model receives for this result."""
         if self.status == "rejected":
             return f"ERROR: {self.note}"
 
+        label = f"command {self.command_id}: " if self.command_id is not None else ""
         if self.status == "running":
-            head = f"still running after {self.elapsed:.0f}s"
+            head = f"{label}still running after {self.elapsed:.0f}s"
             # Distinguishing a slow build from a hung process is the whole
             # reason the agent is being asked - give it the signal that
             # actually separates them.
@@ -373,22 +359,22 @@ class ShellResult:
             return (
                 f"{head}\n"
                 f"output so far:\n{body}\n"
-                f"The command is still running. Use shell_wait to keep waiting, "
-                f"or shell_kill to stop it."
+                f"The command is still running. Use shell_wait to keep waiting, or "
+                f"shell_kill to stop it, with command_id {self.command_id}."
             )
 
         parts = []
         if self.status == "killed":
-            parts.append(f"killed (exit={self.exit_code})")
+            parts.append(f"{label}killed (exit={self.exit_code})")
         else:
-            parts.append(f"exit={self.exit_code}")
+            parts.append(f"{label}exit={self.exit_code}")
         if self.note:
             parts.append(f"[{self.note}]")
         parts.append(f"output:\n{_truncate(self.output)}")
         return "\n".join(parts)
 
 
-class _RunningCommand:
+class SandboxedShellCommand:
     """One `docker exec` in flight, with a `FdDrainer` reading its output.
 
     The command is launched as:
@@ -399,7 +385,7 @@ class _RunningCommand:
 
     - The command is passed as its own argv element (`$1`), never spliced into
       a shell string, so arbitrary quotes, newlines, and backslashes need no
-      escaping - the same guarantee the old file-passing gave, without a file.
+      escaping.
     - `echo "__PID__$$"` then `exec` prints the pid of the bash that (after the
       exec, which preserves the pid) runs the command. That pid is what
       `shell_kill` signals; it travels as the guaranteed-first output line,
@@ -415,8 +401,9 @@ class _RunningCommand:
     this one bash exit non-zero - there is no shared session to wedge.
     """
 
-    def __init__(self, container_id: str, proc: subprocess.Popen):
+    def __init__(self, command_id: int, container_id: str, proc: subprocess.Popen):
         assert proc.stdout is not None
+        self.id = command_id  # the id the agent uses to refer to this command
         self.container_id = container_id
         self.proc = proc
         self.pid: int | None = None  # in-container pid of the command's bash
@@ -435,7 +422,9 @@ class _RunningCommand:
         self._pending = ""  # decoded output produced but not yet returned by drain()
 
     @classmethod
-    def start(cls, container_id: str, cwd: str, command: str) -> _RunningCommand:
+    def start(
+        cls, command_id: int, container_id: str, cwd: str, command: str
+    ) -> SandboxedShellCommand:
         # container_cmd is what docker exec runs inside the container.
         # bash -c accepts the following format:
         # bash -c <script> $0 $1
@@ -481,7 +470,47 @@ class _RunningCommand:
         )
         # fmt: on
 
-        return cls(container_id, proc)
+        return cls(command_id, container_id, proc)
+
+    def wait(self, timeout: float) -> ShellResult:
+        """Wait up to `timeout` seconds for the command to exit. Returns its final result
+        if it did, otherwise the output produced since the last call."""
+        code = self.wait_exit(timeout)
+        if code is not None:
+            return ShellResult(self.drain(), exit_code=code, status="completed", command_id=self.id)
+        return ShellResult(
+            self.drain(),
+            status="running",
+            elapsed=self.elapsed,
+            idle=self.idle,
+            command_id=self.id,
+        )
+
+    def kill(self) -> ShellResult:
+        """Stop the command with SIGTERM, then SIGKILL if it is still running."""
+        elapsed = self.elapsed
+        # TERM first, then KILL. Grandchildren (make -> gcc) can survive as
+        # orphans, which is tolerable because the container is the real boundary
+        # and is disposable.
+        for sig, grace in (("TERM", 5), ("KILL", 5)):
+            self.signal(sig)
+            code = self.wait_exit(grace)
+            if code is not None:
+                return ShellResult(
+                    self.drain(),
+                    exit_code=code,
+                    status="killed",
+                    note=f"SIG{sig} after {elapsed:.0f}s",
+                    command_id=self.id,
+                )
+        # The in-container process is unkillable via signals (should not happen
+        # under gVisor); the caller drops the exec client and moves on.
+        return ShellResult(
+            self.drain(),
+            status="killed",
+            note=f"could not confirm exit after {elapsed:.0f}s",
+            command_id=self.id,
+        )
 
     def drain(self) -> str:
         """Return output produced since the last call (empty if none yet)."""

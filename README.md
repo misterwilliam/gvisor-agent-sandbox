@@ -57,6 +57,7 @@ with Sandbox() as sbx:
             # Provides agent access to sandbox as a tool.
             tools=sbx.TOOLS,
             messages=messages,
+            cache_control={"type": "ephemeral"},
         )
         messages.append({"role": "assistant", "content": response.content})
 
@@ -137,10 +138,12 @@ Requirements:
 
 The agent gets three tools:
 
-- `shell_exec(command, timeout)` - run a bash command in the sandbox. Returns the exit
-  code and output, with stdout and stderr interleaved as they would appear in a terminal.
-- `shell_wait(timeout)` - keep waiting for the running command and get its new output.
-- `shell_kill()` - stop the running command (SIGTERM, then SIGKILL).
+- `shell_exec(command, timeout)` - run a bash command in the sandbox. Returns the
+  command's id, its exit code, and its output, with stdout and stderr interleaved as they
+  would appear in a terminal.
+- `shell_wait(command_id, timeout)` - keep waiting for a running command and get its new
+  output.
+- `shell_kill(command_id)` - stop a running command (SIGTERM, then SIGKILL).
 
 Commands run as root, starting in `/root`. Each command is a separate process. A command
 that runs past its timeout keeps running; the agent gets the output so far and decides

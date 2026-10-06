@@ -40,6 +40,7 @@ def main() -> int:
                 system=SYSTEM,
                 tools=sbx.TOOLS,
                 messages=messages,
+                cache_control={"type": "ephemeral"},
             )
             messages.append({"role": "assistant", "content": response.content})
 

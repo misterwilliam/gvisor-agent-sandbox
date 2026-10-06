@@ -41,34 +41,42 @@ def test_truncation_reports_how_much_it_dropped():
 
 
 def test_rejected_renders_as_the_reason_alone():
-    result = ShellResult(status="rejected", note="no command is currently running")
-    assert result.render() == "ERROR: no command is currently running"
+    result = ShellResult(status="rejected", note="no running command 9")
+    assert str(result) == "ERROR: no running command 9"
 
 
 def test_completed_renders_exit_code_and_output():
-    rendered = ShellResult("hello\n", exit_code=0).render()
+    rendered = str(ShellResult("hello\n", exit_code=0))
     assert "exit=0" in rendered
     assert "hello" in rendered
 
 
 def test_killed_names_the_signal():
-    rendered = ShellResult("", exit_code=143, status="killed", note="SIGTERM after 2s").render()
+    rendered = str(ShellResult("", exit_code=143, status="killed", note="SIGTERM after 2s"))
     assert "killed (exit=143)" in rendered
     assert "[SIGTERM after 2s]" in rendered
 
 
+def test_results_name_their_command():
+    # With several commands running, the agent needs to know which one a
+    # result belongs to.
+    assert str(ShellResult("hi\n", exit_code=0, command_id=4)).startswith("command 4: exit=0")
+
+
 def test_running_with_output_reports_progress():
-    rendered = ShellResult("tick\n", status="running", elapsed=3.0, idle=0.1).render()
+    rendered = str(ShellResult("tick\n", status="running", elapsed=3.0, idle=0.1, command_id=3))
     assert "still running after 3s" in rendered
     assert "produced 5 new characters" in rendered
-    # The agent has to be told what its two options are, or it can't choose.
+    # The agent has to be told what its two options are, and which id to pass, or
+    # it can't choose.
     assert "shell_wait" in rendered and "shell_kill" in rendered
+    assert "command_id 3" in rendered
 
 
 def test_running_without_output_reports_silence():
     # Progress vs. silence is the distinction that separates a slow build from
     # a hung process, and it's the whole reason the agent is being asked.
-    rendered = ShellResult("", status="running", elapsed=10.0, idle=10.0).render()
+    rendered = str(ShellResult("", status="running", elapsed=10.0, idle=10.0, command_id=3))
     assert "no new output for 10s" in rendered
     assert "(nothing new)" in rendered
 
@@ -78,9 +86,9 @@ def test_running_without_output_reports_silence():
 
 def test_tools_report_clearly_when_the_sandbox_is_not_running():
     sandbox = Sandbox()
-    assert sandbox.shell_exec("echo hi") == "ERROR: sandbox is not running"
-    assert sandbox.shell_wait() == "ERROR: sandbox is not running"
-    assert sandbox.shell_kill() == "ERROR: sandbox is not running"
+    assert str(sandbox.shell_exec("echo hi")) == "ERROR: sandbox is not running"
+    assert str(sandbox.shell_wait(1)) == "ERROR: sandbox is not running"
+    assert str(sandbox.shell_kill(1)) == "ERROR: sandbox is not running"
 
 
 def test_dispatch_rejects_an_unknown_tool():
@@ -101,8 +109,8 @@ def test_every_advertised_tool_is_dispatchable():
     # agent as an unexplained error mid-task.
     minimal_input = {
         "shell_exec": {"command": "true"},
-        "shell_wait": {},
-        "shell_kill": {},
+        "shell_wait": {"command_id": 1},
+        "shell_kill": {"command_id": 1},
     }
     sandbox = Sandbox()
     for tool in Sandbox.TOOLS:
